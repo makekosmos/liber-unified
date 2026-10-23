@@ -7,8 +7,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use mupdf::text_page::TextPageFlags;
-use mupdf::{Colorspace, Document, ImageFormat, Matrix, MetadataName, Outline, Pixmap};
+use hayro::hayro_interpret::util::TransformExt;
+use hayro::hayro_interpret::{Context, InterpreterCache, InterpreterSettings, interpret_page};
+use hayro::hayro_syntax::Pdf as Document;
+use hayro::kurbo::Rect;
+use hayro::vello_cpu::color::palette::css::WHITE;
+use hayro::{PixmapSettings, RenderCache, RenderSettings};
+
+#[path = "pdf_nav.rs"]
+mod nav;
+#[path = "pdf_text.rs"]
+mod text;
 
 use crate::flow::{self, Para, RawBlock};
 use crate::notes::{Ch, LinkTarget, PageLink, PageText};
@@ -26,23 +35,19 @@ fn clean(text: String) -> Option<String> {
 }
 
 fn open(path: &Path) -> Result<Document, String> {
-    let path = path.to_str().ok_or("путь не в UTF-8")?;
-    let doc = Document::open(path).map_err(|e| e.to_string())?;
-    if doc.needs_password().map_err(|e| e.to_string())? {
-        return Err("файл защищён паролем".into());
-    }
-    Ok(doc)
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    Document::new(bytes).map_err(|e| format!("не удалось разобрать PDF: {e:?}"))
 }
 
 pub fn probe(path: &Path) -> Result<Meta, String> {
     let doc = open(path)?;
-    let pages = doc.page_count().map_err(|e| e.to_string())?;
-    if pages <= 0 {
+    let pages = doc.pages().len();
+    if pages == 0 {
         return Err("в файле нет страниц".into());
     }
     Ok(Meta {
-        title: doc.metadata(MetadataName::Title).ok().and_then(clean),
-        author: doc.metadata(MetadataName::Author).ok().and_then(clean),
+        title: doc.metadata().title.as_deref().map(nav::decode_text).and_then(clean),
+        author: doc.metadata().author.as_deref().map(nav::decode_text).and_then(clean),
         pages: pages as u32,
     })
 }
@@ -50,21 +55,14 @@ pub fn probe(path: &Path) -> Result<Meta, String> {
 /// Render page 0 as a PNG that fits `width_px` pixels across.
 pub fn save_cover(pdf: &Path, png: &Path, width_px: f32) -> Result<(), String> {
     let doc = open(pdf)?;
-    let page = doc.load_page(0).map_err(|e| e.to_string())?;
-    let bounds = page.bounds().map_err(|e| e.to_string())?;
-    let scale = width_px / (bounds.x1 - bounds.x0).max(1.0);
-    let pixmap = page
-        .to_pixmap(
-            &Matrix::new_scale(scale, scale),
-            &Colorspace::device_rgb(),
-            false,
-            true,
-        )
-        .map_err(|e| e.to_string())?;
-    let png = png.to_str().ok_or("путь не в UTF-8")?;
-    pixmap
-        .save_as(png, ImageFormat::PNG)
-        .map_err(|e| e.to_string())
+    let page = doc.pages().first().ok_or("в PDF нет страниц")?;
+    let (w, _) = page.render_dimensions();
+    let scale = width_px / f32::from(w).max(1.0);
+    let cache = RenderCache::new();
+    let pixmap = hayro::render(page, &cache, &InterpreterSettings::default(), &RenderSettings::default(),
+        &PixmapSettings { x_scale: scale, y_scale: scale, bg_color: WHITE });
+    let image = image::RgbaImage::from_raw(u32::from(pixmap.width()), u32::from(pixmap.height()), pixmap.data_as_u8_slice().to_vec()).ok_or("hayro вернул некорректный буфер")?;
+    image.save(png).map_err(|e| e.to_string())
 }
 
 /// Reading theme: how page bitmaps are recoloured and what the reflowed
@@ -129,19 +127,10 @@ pub struct Rendered {
     pub bgra: Vec<u8>,
 }
 
-fn to_bgra(pixmap: &Pixmap, tone: Tone) -> Rendered {
-    let (width, height) = (pixmap.width() as usize, pixmap.height() as usize);
-    let n = pixmap.n() as usize;
-    let stride = pixmap.stride() as usize;
-    let samples = pixmap.samples();
+fn to_bgra(width: usize, height: usize, samples: &[u8], tone: Tone) -> Rendered {
     let mut bgra = Vec::with_capacity(width * height * 4);
-    for row in samples.chunks(stride).take(height) {
-        for px in row.chunks(n).take(width) {
-            let (r, g, b) = if n == 1 {
-                (px[0], px[0], px[0])
-            } else {
-                (px[0], px[1], px[2])
-            };
+    for px in samples.chunks_exact(4).take(width * height) {
+            let (r, g, b) = (px[0], px[1], px[2]);
             let (r, g, b) = match tone {
                 Tone::Day => (r, g, b),
                 // Multiply by the paper colour: white becomes cream, ink stays dark.
@@ -151,7 +140,6 @@ fn to_bgra(pixmap: &Pixmap, tone: Tone) -> Rendered {
                 Tone::Gray => (lift(255 - r), lift(255 - g), lift(255 - b)),
             };
             bgra.extend_from_slice(&[b, g, r, 255]);
-        }
     }
     Rendered {
         width: width as u32,
@@ -173,17 +161,6 @@ pub struct TocEntry {
     pub title: String,
     pub page: Option<u32>,
     pub depth: u8,
-}
-
-fn flatten(items: &[Outline], depth: u8, out: &mut Vec<TocEntry>) {
-    for item in items {
-        out.push(TocEntry {
-            title: item.title.trim().to_owned(),
-            page: item.dest.as_ref().map(|d| d.loc.page_number),
-            depth,
-        });
-        flatten(&item.down, depth.saturating_add(1), out);
-    }
 }
 
 /// Everything the reader needs before the first page is drawn.
@@ -487,157 +464,61 @@ fn next_work(shared: &SharedWork) -> Option<Request> {
 }
 
 fn load_opened(doc: &Document) -> Result<Opened, String> {
-    let count = doc.page_count().map_err(|e| e.to_string())?;
-    let mut sizes = Vec::with_capacity(count.max(0) as usize);
-    for i in 0..count {
-        let bounds = doc
-            .load_page(i)
-            .and_then(|p| p.bounds())
-            .map_err(|e| e.to_string())?;
-        sizes.push((
-            (bounds.x1 - bounds.x0).max(1.0),
-            (bounds.y1 - bounds.y0).max(1.0),
-        ));
-    }
-    let mut toc = Vec::new();
-    if let Ok(outline) = doc.outlines() {
-        flatten(&outline, 0, &mut toc);
-    }
+    let sizes = doc.pages().iter().map(|p| { let (w,h)=p.render_dimensions(); (f32::from(w).max(1.0), f32::from(h).max(1.0)) }).collect();
+    let toc = nav::outline(doc).into_iter().map(|e| TocEntry { title:e.title, page:e.page.map(|p| p as u32), depth:e.depth.min(u8::MAX as usize) as u8 }).collect();
     Ok(Opened { sizes, toc })
 }
 
 fn extract_text(doc: &Document, page: u32) -> Result<PageText, String> {
-    let page = doc.load_page(page as i32).map_err(|e| e.to_string())?;
-    let origin = page.bounds().map_err(|e| e.to_string())?;
-    let text = page
-        .to_text_page(TextPageFlags::PRESERVE_LIGATURES | TextPageFlags::PRESERVE_WHITESPACE)
-        .map_err(|e| e.to_string())?;
+    let page_ref = doc.pages().get(page as usize).ok_or("страница вне диапазона")?;
+    let (w,h)=page_ref.render_dimensions();
+    let cache=InterpreterCache::new();
+    let transform=page_ref.initial_transform(true).to_kurbo();
+    let mut ctx=Context::new(transform, Rect::new(0.0,0.0,f64::from(w),f64::from(h)), &cache, page_ref.xref(), InterpreterSettings::default());
+    let mut device=text::TextDevice::default();
+    interpret_page(page_ref,&mut ctx,&mut device);
     let mut chars = Vec::new();
-    let mut line_no = 0u32;
-    for block in text.blocks() {
-        for line in block.lines() {
-            for ch in line.chars() {
-                let Some(c) = ch.char() else { continue };
-                let q = ch.quad();
-                let xs = [q.ul.x, q.ur.x, q.ll.x, q.lr.x];
-                let ys = [q.ul.y, q.ur.y, q.ll.y, q.lr.y];
-                let min = |v: &[f32; 4]| v.iter().copied().fold(f32::MAX, f32::min);
-                let max = |v: &[f32; 4]| v.iter().copied().fold(f32::MIN, f32::max);
-                chars.push(Ch {
-                    c,
-                    r: [
-                        min(&xs) - origin.x0,
-                        min(&ys) - origin.y0,
-                        max(&xs) - origin.x0,
-                        max(&ys) - origin.y0,
-                    ],
-                    line: line_no,
-                });
-            }
-            line_no += 1;
+    let mut line_no=0u32;
+    let mut last_y=None;
+    for g in &device.glyphs {
+        if g.text.is_empty() { continue; }
+        if last_y.is_some_and(|y:f64| (g.y-y).abs()>g.size.max(1.0)*0.5) { line_no+=1; }
+        last_y=Some(g.y);
+        let width=g.advance.max(g.size*0.25);
+        for c in g.text.chars() {
+            chars.push(Ch { c, r:[g.x as f32,(g.y-g.size*0.8) as f32,(g.x+width) as f32,g.y as f32], line:line_no });
         }
     }
-    let mut links = Vec::new();
-    if let Ok(iter) = page.links() {
-        for link in iter {
-            let target = match link.dest {
-                Some(d) => LinkTarget::Page(d.loc.page_number),
-                None if link.uri.contains("://") || link.uri.starts_with("mailto:") => {
-                    LinkTarget::Uri(link.uri.clone())
-                }
-                None => continue,
-            };
-            let b = link.bounds;
-            links.push(PageLink {
-                r: [
-                    b.x0 - origin.x0,
-                    b.y0 - origin.y0,
-                    b.x1 - origin.x0,
-                    b.y1 - origin.y0,
-                ],
-                target,
-            });
-        }
-    }
+    let links=nav::links(doc,page as usize).into_iter().filter_map(|l| { let target=match l.target { nav::LinkTarget::Page(p)=>LinkTarget::Page(p as u32), nav::LinkTarget::Uri(s)=>LinkTarget::Uri(s), nav::LinkTarget::Unresolved=>return None }; Some(PageLink {r:[l.rect[0] as f32,l.rect[1] as f32,l.rect[2] as f32,l.rect[3] as f32],target}) }).collect();
     Ok(PageText { chars, links })
 }
 
 fn extract_plain(doc: &Document, page: u32) -> Result<String, String> {
-    let page = doc.load_page(page as i32).map_err(|e| e.to_string())?;
-    let text = page
-        .to_text_page(TextPageFlags::empty())
-        .map_err(|e| e.to_string())?;
-    let mut out = String::new();
-    for block in text.blocks() {
-        for line in block.lines() {
-            for ch in line.chars() {
-                if let Some(c) = ch.char() {
-                    out.push(c);
-                }
-            }
-            out.push(' ');
-        }
-    }
-    Ok(out)
+    let page_ref=doc.pages().get(page as usize).ok_or("страница вне диапазона")?;
+    let (w,h)=page_ref.render_dimensions(); let cache=InterpreterCache::new();
+    let mut ctx=Context::new(page_ref.initial_transform(true).to_kurbo(),Rect::new(0.0,0.0,f64::from(w),f64::from(h)),&cache,page_ref.xref(),InterpreterSettings::default());
+    let mut device=text::TextDevice::default(); interpret_page(page_ref,&mut ctx,&mut device);
+    Ok(text::to_lines(&device.glyphs))
 }
 
 /// Return freed MuPDF memory to the OS (macOS keeps it in the malloc zone).
-fn relieve_memory() {
-    unsafe extern "C" {
-        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-    }
-    // SAFETY: a null zone means "all zones"; the call has no other preconditions.
-    unsafe {
-        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-    }
-}
+fn relieve_memory() {}
 
 fn extract_flow(doc: &Document, page: u32) -> Result<Vec<Para>, String> {
-    let page = doc.load_page(page as i32).map_err(|e| e.to_string())?;
-    let bounds = page.bounds().map_err(|e| e.to_string())?;
-    let text = page
-        .to_text_page(TextPageFlags::PRESERVE_LIGATURES)
-        .map_err(|e| e.to_string())?;
-    let mut blocks = Vec::new();
-    for block in text.blocks() {
-        let mut lines = Vec::new();
-        let mut line_bounds = Vec::new();
-        let mut monospace = 0;
-        let mut indents = Vec::new();
-        let (mut size_sum, mut n) = (0.0f32, 0u32);
-        for line in block.lines() {
-            let mut s = String::new();
-            for ch in line.chars() {
-                if let Some(c) = ch.char() {
-                    s.push(c);
-                    if !c.is_whitespace() {
-                        size_sum += ch.size();
-                        n += 1;
-                        if ch.font().is_some_and(|font| font.is_monospaced()) { monospace += 1; }
-                    }
-                }
-            }
-            lines.push(s);
-            let b = line.bounds();
-            line_bounds.push((b.y0 - bounds.y0, b.y1 - bounds.y0));
-            let unit = if n > 0 { size_sum / n as f32 * 0.6 } else { 6.0 };
-            indents.push(((b.x0 - block.bounds().x0).max(0.0) / unit).round() as usize);
-        }
-        if n == 0 {
-            continue;
-        }
-        let b = block.bounds();
-        blocks.push(RawBlock {
-            lines,
-            size: size_sum / n as f32,
-            y0: b.y0 - bounds.y0,
-            y1: b.y1 - bounds.y0,
-            line_bounds,
-            mono: monospace * 2 > n,
-            indents,
-        });
-    }
-    let mut paras = flow::paragraphs(&blocks, bounds.y1 - bounds.y0);
+    let page_ref=doc.pages().get(page as usize).ok_or("страница вне диапазона")?;
+    let (w,h)=page_ref.render_dimensions(); let height=f32::from(h);
+    let cache=InterpreterCache::new();
+    let mut ctx=Context::new(page_ref.initial_transform(true).to_kurbo(),Rect::new(0.0,0.0,f64::from(w),f64::from(h)),&cache,page_ref.xref(),InterpreterSettings::default());
+    let mut device=text::TextDevice::default(); interpret_page(page_ref,&mut ctx,&mut device);
+    if device.glyphs.iter().all(|g|g.text.is_empty()) { return Ok(Vec::new()); }
+    let mut rows: Vec<Vec<&text::Glyph>>=Vec::new();
+    let mut glyphs:Vec<_>=device.glyphs.iter().filter(|g|!g.text.is_empty()).collect();
+    glyphs.sort_by(|a,b|a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+    for g in glyphs { if let Some(row)=rows.last_mut().filter(|row|(row[0].y-g.y).abs()<g.size.max(1.0)*0.5) {row.push(g)} else {rows.push(vec![g])} }
+    let lines:Vec<String>=rows.iter().map(|row| {let refs:Vec<_>=row.iter().map(|g|(*g).clone()).collect(); text::to_lines(&refs)}).collect();
+    let size=device.glyphs.iter().map(|g|g.size as f32).sum::<f32>()/device.glyphs.len().max(1) as f32;
+    let blocks=vec![RawBlock {lines,size,y0:0.0,y1:height,line_bounds:Vec::new(),mono:false,indents:Vec::new()}];
+    let mut paras = flow::paragraphs(&blocks, height);
     for para in &mut paras { para.repair(&flow::Vocab::default()); }
     Ok(paras)
 }
@@ -646,7 +527,7 @@ fn extract_flow(doc: &Document, page: u32) -> Result<Vec<Para>, String> {
 /// the book's own vocabulary. May swap `doc` for a fresh handle to shed caches.
 #[cfg(test)]
 fn repaired_flow(doc: &mut Document, path: &Path) -> Vec<Vec<Para>> {
-    let pages = doc.page_count().unwrap_or(0).max(0) as u32;
+    let pages = doc.pages().len() as u32;
     let mut raw = Vec::with_capacity(pages as usize);
     for page in 0..pages {
         raw.push(extract_flow(doc, page).unwrap_or_default());
@@ -666,56 +547,25 @@ fn repaired_flow(doc: &mut Document, path: &Path) -> Vec<Vec<Para>> {
 
 /// A small per-document cache of parsed drawing commands. Tiles reuse these
 /// instead of parsing the same PDF page for every rectangle.
-struct Rasterizer {
-    lists: VecDeque<(u32, mupdf::DisplayList)>,
-}
+struct Rasterizer;
 
 impl Rasterizer {
     fn render(&mut self, doc: &Document, key: RasterKey) -> Result<Rendered, String> {
-        if !self.lists.iter().any(|(page, _)| *page == key.page) {
-            let page = doc.load_page(key.page as i32).map_err(|e| e.to_string())?;
-            let list = page.to_display_list(true).map_err(|e| e.to_string())?;
-            self.lists.push_back((key.page, list));
-            while self.lists.len() > 2 {
-                self.lists.pop_front();
-            }
+        let page=doc.pages().get(key.page as usize).ok_or("страница вне диапазона")?;
+        if page.raw().contains_key("Contents") && page.page_stream().is_none() {
+            return Err("page content stream could not be parsed".into());
         }
-        let at = self.lists.iter().position(|(p, _)| *p == key.page).unwrap();
-        let item = self.lists.remove(at).unwrap();
-        self.lists.push_back(item);
-        let list = &self.lists.back().unwrap().1;
-        let scale = key.factor();
-        let bounds = list.bounds();
-        let mut matrix = Matrix::new_scale(scale, scale);
-        matrix.pre_translate(-bounds.x0, -bounds.y0);
-        let pixmap = if let Some(tile) = key.tile {
-            let mut pixmap = Pixmap::new(
-                &Colorspace::device_rgb(),
-                tile.x as i32,
-                tile.y as i32,
-                tile.width as i32,
-                tile.height as i32,
-                false,
-            )
-            .map_err(|e| e.to_string())?;
-            pixmap.clear_with(255).map_err(|e| e.to_string())?;
-            {
-                let device = mupdf::Device::from_pixmap(&pixmap).map_err(|e| e.to_string())?;
-                let area = mupdf::Rect::new(
-                    tile.x as f32,
-                    tile.y as f32,
-                    (tile.x + tile.width) as f32,
-                    (tile.y + tile.height) as f32,
-                );
-                list.run(&device, &matrix, area)
-                    .map_err(|e| e.to_string())?;
-            }
-            pixmap
-        } else {
-            list.to_pixmap(&matrix, &Colorspace::device_rgb(), false)
-                .map_err(|e| e.to_string())?
-        };
-        Ok(to_bgra(&pixmap, key.tone))
+        let scale=key.factor(); let cache=RenderCache::new();
+        let pixmap=hayro::render(page,&cache,&InterpreterSettings::default(),&RenderSettings::default(),&PixmapSettings{x_scale:scale,y_scale:scale,bg_color:WHITE});
+        let (w,h)=(u32::from(pixmap.width()),u32::from(pixmap.height()));
+        let rgba=pixmap.data_as_u8_slice();
+        let full=to_bgra(w as usize,h as usize,rgba,key.tone);
+        if let Some(t)=key.tile {
+            let x=t.x.min(w); let y=t.y.min(h); let tw=t.width.min(w-x); let th=t.height.min(h-y);
+            let mut bgra=Vec::with_capacity(tw as usize*th as usize*4);
+            for row in y..y+th { let start=((row*w+x)*4) as usize; bgra.extend_from_slice(&full.bgra[start..start+(tw*4) as usize]); }
+            Ok(Rendered{width:tw,height:th,bgra})
+        } else { Ok(full) }
     }
 }
 
@@ -821,7 +671,6 @@ fn worker(
     struct Cleanup;
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            mupdf::Context::get().trim_store(0);
             relieve_memory();
         }
     }
@@ -853,10 +702,7 @@ fn worker(
     if opened.send(info).is_err() {
         return;
     }
-    mupdf::Context::get().trim_store(25);
-    let mut rasterizer = Rasterizer {
-        lists: VecDeque::new(),
-    };
+    let mut rasterizer = Rasterizer;
     let mut touched = std::collections::HashSet::new();
     while let Some(request) = next_work(&shared) {
         if let Some(page) = match &request {
@@ -870,10 +716,8 @@ fn worker(
         // Bound both layers. Repeated tiles of the same page do not rotate it.
         if touched.len() >= 16 {
             if let Ok(fresh) = open(&path) {
-                rasterizer.lists.clear();
                 doc = fresh;
                 touched.clear();
-                mupdf::Context::get().trim_store(25);
                 relieve_memory();
             }
         }
@@ -927,8 +771,6 @@ fn worker(
                 }
             }
             Request::Trim => {
-                rasterizer.lists.clear();
-                mupdf::Context::get().trim_store(0);
                 relieve_memory();
             }
         }
@@ -1307,9 +1149,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("liber-tile-{}.pdf", std::process::id()));
         std::fs::write(&path, test_pdf::with_text("Hello tiled PDF")).unwrap();
         let doc = open(&path).unwrap();
-        let mut raster = Rasterizer {
-            lists: VecDeque::new(),
-        };
+        let mut raster = Rasterizer;
         let full_key = RasterKey {
             page: 0,
             scale: 100,
