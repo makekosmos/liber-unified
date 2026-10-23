@@ -1,51 +1,30 @@
-// Liber: local-first library and PDF reader.
-mod app;
-mod appearance;
-mod ui;
-mod assets;
-mod flow;
-mod library;
-mod meta;
-mod mac;
-mod notes;
-mod pdf;
-mod reader;
-mod raster;
-mod reading_state;
-mod syntax;
+//! Runs the Rust application directly on the machine's native backend.
 
-use gpui::{px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-fn main() {
-    gpui::application().with_assets(assets::Assets).run(|cx: &mut App| {
-        gpui_component::init(cx);
-        cx.text_system()
-            .add_fonts(assets::font_bytes())
-            .expect("failed to load embedded fonts");
-        app::install_menu(cx);
-        appearance::apply(&appearance::load(&library::default_root()), cx);
+#[cfg(target_os = "linux")]
+use nsh_platform_linux as platform;
+#[cfg(target_os = "macos")]
+use nsh_platform_macos as platform;
+#[cfg(target_os = "windows")]
+use nsh_platform_windows as platform;
 
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1280.), px(840.)),
-                cx,
-            ))),
-            titlebar: Some(gpui::TitlebarOptions {
-                title: None,
-                appears_transparent: true,
-                // Position once AppKit has created the buttons: their actual
-                // height determines the inset into our shared titlebar grid.
-                traffic_light_position: None,
-            }),
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn main() -> impl std::process::Termination {
+    env_logger::init();
+    platform::run_app(
+        platform::AppSource::Rust(platform::Root::of::<liber::App>()),
+        platform::AppOptions {
+            title: "Liber".to_owned(),
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            app_id: "com.kosmos.liber".to_owned(),
+            size: (1200, 820),
             ..Default::default()
-        };
-        cx.open_window(options, |window, cx| {
-            mac::align_traffic_lights(window);
-            let liber = cx.new(|cx| app::Liber::new(window, cx));
-            cx.new(|cx| gpui_component::Root::new(liber, window, cx))
-        })
-        .expect("open window");
-        cx.activate(true);
-    });
+        },
+    )
 }
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!(
+    "Run this binary on macOS, Windows or Linux; use the TSX entry with nsh run for iOS and Android."
+);

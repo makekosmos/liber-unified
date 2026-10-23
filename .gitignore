@@ -1,3 +1,2 @@
+/.nsh/
 /target/
-**/*.rs.bk
-.DS_Store

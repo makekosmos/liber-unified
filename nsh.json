@@ -1,6 +1,6 @@
 {
   "name": "Liber",
-  "id": "com.example.liber",
+  "id": "com.kosmos.liber",
   "version": "1.0.0",
   "build": 1,
   "rust": ".",

@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use hayro::hayro_syntax::object::{Array, Dict, MaybeRef, Name, ObjRef, Object, ObjectIdentifier};
 use hayro::hayro_syntax::Pdf;
+use hayro::hayro_syntax::object::{Array, Dict, MaybeRef, Name, ObjRef, Object, ObjectIdentifier};
 
 /// Upper bound on outline nodes, so a cyclic or hostile outline cannot hang the walk.
 const MAX_OUTLINE: usize = 20_000;
@@ -173,7 +173,9 @@ pub fn debug_first_dest(pdf: &Pdf) -> String {
         ),
         _ => "-".into(),
     };
-    format!("Dest={dest:?} A.D={action_d:?} NamesDests={names_dests} LegacyDests={legacy} page_ids={ids:?} firstElemIsRef={arr_kind}")
+    format!(
+        "Dest={dest:?} A.D={action_d:?} NamesDests={names_dests} LegacyDests={legacy} page_ids={ids:?} firstElemIsRef={arr_kind}"
+    )
 }
 
 pub fn outline(pdf: &Pdf) -> Vec<TocEntry> {
