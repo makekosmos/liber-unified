@@ -1,0 +1,7 @@
+# Pin identical to toolchain.json ("rust") — CI fails when they disagree.
+# Consumers record toolchain.json in their BOM; this file is what rustup
+# installs locally so the local gate builds the same compiler.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

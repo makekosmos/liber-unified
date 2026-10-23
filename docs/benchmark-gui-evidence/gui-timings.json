@@ -1,0 +1,72 @@
+{
+  "units": "milliseconds; CUA action start to observation completion, including automation overhead",
+  "Liber": {
+    "import": [
+      985
+    ],
+    "firstOpen": [
+      688
+    ],
+    "warmOpen": [
+      611,
+      676,
+      589
+    ],
+    "searchWarm": [
+      600,
+      602,
+      594
+    ],
+    "jump732": [
+      532,
+      414,
+      420
+    ],
+    "zoomApprox306": [
+      416
+    ],
+    "scroll": {
+      "start": 1791928041.675,
+      "end": 1791928052.18,
+      "commands": 145,
+      "pageFrom": 1,
+      "pageTo": 61
+    }
+  },
+  "Zotero": {
+    "firstOpen": {
+      "firstObservationBlankAtMs": 1110,
+      "readableConfirmedByMs": 6931
+    },
+    "warmOpen": [
+      879,
+      1946,
+      1823
+    ],
+    "searchWarm": [
+      1989,
+      1950,
+      1986
+    ],
+    "jump400": [
+      1253,
+      449,
+      477
+    ],
+    "zoomOneStep": [
+      555
+    ],
+    "scroll": {
+      "start": 1791928058.818,
+      "end": 1791928069.661,
+      "commands": 79,
+      "pageFrom": 1,
+      "pageTo": 29
+    }
+  },
+  "excluded": [
+    "User-instance preflight observations",
+    "Zotero import action: UI-change exception lost start timestamp",
+    "Zotero initial setValue search: no result at first observation"
+  ]
+}

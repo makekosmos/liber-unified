@@ -1,0 +1,37 @@
+[
+  {
+    "run": 1,
+    "profile": "test (opt-level=1)",
+    "cache": "cold, separate temporary directory",
+    "exit": 0,
+    "output": "\nrunning 1 test\nSTREAM_FLOW pages=732 text_bytes=2828386 elapsed_ms=3989 sampled_peak_rss_mib=100.6\ntest pdf::tests::real_book_incremental_flow_memory ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 4.03s\n\n"
+  },
+  {
+    "run": 2,
+    "profile": "test (opt-level=1)",
+    "cache": "cold, separate temporary directory",
+    "exit": 0,
+    "output": "\nrunning 1 test\nSTREAM_FLOW pages=732 text_bytes=2828386 elapsed_ms=7422 sampled_peak_rss_mib=139.3\ntest pdf::tests::real_book_incremental_flow_memory ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 7.45s\n\n"
+  },
+  {
+    "run": 3,
+    "profile": "test (opt-level=1)",
+    "cache": "cold, separate temporary directory",
+    "exit": 0,
+    "output": "\nrunning 1 test\nSTREAM_FLOW pages=732 text_bytes=2828386 elapsed_ms=4841 sampled_peak_rss_mib=135.2\ntest pdf::tests::real_book_incremental_flow_memory ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 4.88s\n\n"
+  },
+  {
+    "run": 4,
+    "profile": "test (opt-level=1)",
+    "cache": "cold, separate temporary directory",
+    "exit": 0,
+    "output": "\nrunning 1 test\nSTREAM_FLOW pages=732 text_bytes=2828386 elapsed_ms=3772 sampled_peak_rss_mib=100.1\ntest pdf::tests::real_book_incremental_flow_memory ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 3.80s\n\n"
+  },
+  {
+    "run": 5,
+    "profile": "test (opt-level=1)",
+    "cache": "cold, separate temporary directory",
+    "exit": 0,
+    "output": "\nrunning 1 test\nSTREAM_FLOW pages=732 text_bytes=2828386 elapsed_ms=4009 sampled_peak_rss_mib=98.2\ntest pdf::tests::real_book_incremental_flow_memory ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 39 filtered out; finished in 4.04s\n\n"
+  }
+]

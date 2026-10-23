@@ -1,0 +1,44 @@
+{
+  "Liber": {
+    "empty_library_rss_mib_median": 93.171875,
+    "empty_library_samples": 80,
+    "rss_peak_mib": 2732.625,
+    "rss_peak_time": 1791928105.8482208,
+    "scroll_rss_peak_mib": 691.046875,
+    "scroll_ps_cpu_peak_pct": 102.6,
+    "rss_at_first_sample_after_scroll_mib": 679.96875,
+    "idle_cpu_pct_runs": [
+      1.2316541393656697,
+      1.265201222999519,
+      1.1650681149976945
+    ],
+    "idle_cpu_pct_median": 1.2316541393656697,
+    "idle_rss_mib_runs": [
+      177.921875,
+      177.921875,
+      177.734375
+    ],
+    "idle_rss_mib_median": 177.921875
+  },
+  "Zotero": {
+    "empty_library_rss_mib_median": 215.234375,
+    "empty_library_samples": 787,
+    "rss_peak_mib": 1993.703125,
+    "rss_peak_time": 1791928067.082061,
+    "scroll_rss_peak_mib": 1993.703125,
+    "scroll_ps_cpu_peak_pct": 153.7,
+    "rss_at_first_sample_after_scroll_mib": 1717.34375,
+    "idle_cpu_pct_runs": [
+      2.2302926307432656,
+      2.1641599867097487,
+      2.196985588281252
+    ],
+    "idle_cpu_pct_median": 2.196985588281252,
+    "idle_rss_mib_runs": [
+      842.734375,
+      842.796875,
+      843.453125
+    ],
+    "idle_rss_mib_median": 842.796875
+  }
+}

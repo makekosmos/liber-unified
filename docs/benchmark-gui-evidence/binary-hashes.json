@@ -1,0 +1,22 @@
+{
+  "Liber": [
+    {
+      "path": "/Users/user/Applications/Liber.app/Contents/MacOS/Liber",
+      "sha256": "abf4e79612d0a30a2864141c97457d06d7fb4af677604e9f19d192e38f0716d1"
+    },
+    {
+      "path": "/tmp/liber-gui-benchmark/Liber Benchmark.app/Contents/MacOS/Liber",
+      "sha256": "abf4e79612d0a30a2864141c97457d06d7fb4af677604e9f19d192e38f0716d1"
+    }
+  ],
+  "Zotero": [
+    {
+      "path": "/Applications/Zotero.app/Contents/MacOS/zotero",
+      "sha256": "7daa49fec5d27bdafcf49d2f425b21cba684e59718c8e5399679f6353025b116"
+    },
+    {
+      "path": "/tmp/liber-gui-benchmark/Zotero Benchmark.app/Contents/MacOS/zotero",
+      "sha256": "1e690d167b3a033e7a784d494a121f461cb9aaa8167d98ce4de42a81b1b34cf7"
+    }
+  ]
+}

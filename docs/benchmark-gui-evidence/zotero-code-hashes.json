@@ -1,0 +1,22 @@
+[
+  {
+    "path": "/Applications/Zotero.app/Contents/MacOS/zotero",
+    "arm64_text_sections": {
+      "__text": "45fe3e0c823bb38f310f1448c65f1b1b46999e6cb1dea337a5d9872087f532fd",
+      "__stubs": "b80f23415ee08297a461a94ab4a8536c1591caa779f73810a8a7053dd3aa90ee",
+      "__stub_helper": "a4f3a121963bbaaffbd0b8f5f840c484f5c837568d23cb72f22ddf87550c3865",
+      "__cstring": "38d9f8c7124974262c547768a87f873984b7c535a6783a90709eb3d46632c463",
+      "__unwind_info": "c81912393f2748b311eeeb82f3515652f5419f5fe2572a51b96f6c9e84400d96"
+    }
+  },
+  {
+    "path": "/tmp/liber-gui-benchmark/Zotero Benchmark.app/Contents/MacOS/zotero",
+    "arm64_text_sections": {
+      "__text": "45fe3e0c823bb38f310f1448c65f1b1b46999e6cb1dea337a5d9872087f532fd",
+      "__stubs": "b80f23415ee08297a461a94ab4a8536c1591caa779f73810a8a7053dd3aa90ee",
+      "__stub_helper": "a4f3a121963bbaaffbd0b8f5f840c484f5c837568d23cb72f22ddf87550c3865",
+      "__cstring": "38d9f8c7124974262c547768a87f873984b7c535a6783a90709eb3d46632c463",
+      "__unwind_info": "c81912393f2748b311eeeb82f3515652f5419f5fe2572a51b96f6c9e84400d96"
+    }
+  }
+]
