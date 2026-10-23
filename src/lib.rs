@@ -1,65 +1,22 @@
 //! Liber desktop app. The native UI and PDF reader share one application root.
-use hayro::hayro_interpret::util::TransformExt;
-use hayro::hayro_interpret::{Context, InterpreterCache, InterpreterSettings, interpret_page};
-use hayro::hayro_syntax::Pdf;
-use hayro::kurbo::Rect;
-use hayro::vello_cpu::color::palette::css::WHITE;
-use hayro::{PixmapSettings, RenderCache, RenderSettings};
+use liber_core::{import_pdf, load_books, render, save_books, search_books, set_progress};
 use nsh_base::{button, safe_area_view};
 use nsh_core::color::rgb;
 use nsh_core::ui::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-
-#[path = "pdf_nav.rs"]
-mod pdf_nav;
-#[path = "pdf_text.rs"]
-mod pdf_text;
+use std::path::PathBuf;
 
 const LIBER_BG: u32 = 0xF5F5F7;
 const LIBER_SIDEBAR: u32 = 0xEBEBED;
 const LIBER_ACCENT: u32 = 0x007AFF;
 const LIBER_INK: u32 = 0x202124;
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-struct Book {
-    title: String,
-    path: String,
-    pages: usize,
-    last_page: usize,
-}
-
-fn index_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Liber")
-        .join("library.json")
-}
-fn load_books() -> Vec<Book> {
-    std::fs::read(index_path())
-        .ok()
-        .and_then(|v| serde_json::from_slice(&v).ok())
-        .unwrap_or_default()
-}
-fn save_books(books: &[Book]) {
-    let path = index_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(bytes) = serde_json::to_vec_pretty(books) {
-        let _ = std::fs::write(path, bytes);
-    }
-}
 fn appearance_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Liber")
-        .join("appearance.json")
+    liber_core::default_root().join("appearance.json")
 }
 fn load_dark() -> bool {
     std::fs::read(appearance_path())
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(false)
 }
 fn save_dark(dark: bool) {
@@ -70,77 +27,6 @@ fn save_dark(dark: bool) {
     if let Ok(bytes) = serde_json::to_vec(&dark) {
         let _ = std::fs::write(path, bytes);
     }
-}
-
-struct Page {
-    count: usize,
-    png: String,
-    text: String,
-    toc: Vec<(String, usize)>,
-    size: (u32, u32),
-}
-fn render(path: &str, index: usize, dark: bool) -> Result<Page, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let pdf = Pdf::new(bytes).map_err(|e| format!("Не удалось открыть PDF: {e:?}"))?;
-    let page = pdf.pages().get(index).ok_or("Страница не найдена")?;
-    if page.raw().contains_key("Contents") && page.page_stream().is_none() {
-        return Err("Не удалось разобрать содержимое страницы".into());
-    }
-    let toc = pdf_nav::outline(&pdf)
-        .into_iter()
-        .filter_map(|entry| entry.page.map(|at| (entry.title, at)))
-        .collect();
-    let (width, height) = page.render_dimensions();
-    let cache = RenderCache::new();
-    let pixmap = hayro::render(
-        page,
-        &cache,
-        &InterpreterSettings::default(),
-        &RenderSettings::default(),
-        &PixmapSettings {
-            x_scale: 1.5,
-            y_scale: 1.5,
-            bg_color: WHITE,
-        },
-    );
-    let size = (u32::from(pixmap.width()), u32::from(pixmap.height()));
-    let mut image = image::RgbaImage::from_raw(
-        u32::from(pixmap.width()),
-        u32::from(pixmap.height()),
-        pixmap.data_as_u8_slice().to_vec(),
-    )
-    .ok_or("Ошибка буфера hayro")?;
-    if dark {
-        for pixel in image.pixels_mut() {
-            pixel.0 = [255 - pixel[0], 255 - pixel[1], 255 - pixel[2], pixel[3]];
-        }
-    }
-    let temp = std::env::temp_dir().join(format!("liber-nsh-page-{index}.png"));
-    image.save(&temp).map_err(|e| e.to_string())?;
-    let cache = InterpreterCache::new();
-    let mut context = Context::new(
-        page.initial_transform(true).to_kurbo(),
-        Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
-        &cache,
-        page.xref(),
-        InterpreterSettings::default(),
-    );
-    let mut device = pdf_text::TextDevice::default();
-    interpret_page(page, &mut context, &mut device);
-    Ok(Page {
-        count: pdf.pages().len(),
-        png: temp.to_string_lossy().into_owned(),
-        text: pdf_text::to_lines(&device.glyphs),
-        toc,
-        size,
-    })
-}
-fn title(path: &str) -> String {
-    Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Без названия")
-        .to_owned()
 }
 
 #[native_module("liber/native")]
@@ -160,36 +46,33 @@ pub fn App() -> impl IntoElement {
     let mut startup_outline = Vec::new();
     let mut startup_size = (1, 1);
     if let Some(source) = std::env::var_os("LIBER_OPEN_PDF").map(PathBuf::from) {
-        let source = source.to_string_lossy().into_owned();
-        if let Ok(first) = render(&source, 0, false) {
-            let at = startup_books
-                .iter()
-                .position(|book| book.path == source)
-                .unwrap_or_else(|| {
-                    startup_books.push(Book {
-                        title: title(&source),
-                        path: source.clone(),
-                        pages: first.count,
-                        last_page: 0,
+        if let Ok(book) = import_pdf(&source) {
+            let source = book.path.clone();
+            if let Ok(first) = render(&source, 0, false) {
+                let at = startup_books
+                    .iter()
+                    .position(|book| book.path == source)
+                    .unwrap_or_else(|| {
+                        startup_books.push(book.clone());
+                        startup_books.len() - 1
                     });
-                    startup_books.len() - 1
-                });
-            startup_path = source;
-            startup_selected = Some(at);
-            startup_count = first.count;
-            startup_page = startup_books[at]
-                .last_page
-                .min(first.count.saturating_sub(1));
-            let loaded = if startup_page == 0 {
-                Some(first)
-            } else {
-                render(&startup_path, startup_page, false).ok()
-            };
-            if let Some(data) = loaded {
-                startup_image = data.png;
-                startup_text = data.text;
-                startup_outline = data.toc;
-                startup_size = data.size;
+                startup_path = source;
+                startup_selected = Some(at);
+                startup_count = first.count;
+                startup_page = startup_books[at]
+                    .last_page
+                    .min(first.count.saturating_sub(1));
+                let loaded = if startup_page == 0 {
+                    Some(first)
+                } else {
+                    render(&startup_path, startup_page, false).ok()
+                };
+                if let Some(data) = loaded {
+                    startup_image = data.png;
+                    startup_text = data.text;
+                    startup_outline = data.toc;
+                    startup_size = data.size;
+                }
             }
         }
     }
@@ -204,6 +87,7 @@ pub fn App() -> impl IntoElement {
     let outline = signal(startup_outline);
     let image_size = signal(startup_size);
     let error = signal(String::new());
+    let query = signal(String::new());
     let dark = signal(load_dark());
 
     let load = std::rc::Rc::new(move |at: usize| {
@@ -223,8 +107,13 @@ pub fn App() -> impl IntoElement {
                 error.set(String::new());
                 if let Some(i) = selected.get() {
                     let mut list = books.get();
-                    if let Some(book) = list.get_mut(i) {
-                        book.last_page = at;
+                    if let Some(book) = list.get(i) {
+                        let id = book.id.clone();
+                        if id.is_empty() {
+                            list[i].last_page = at;
+                        } else {
+                            set_progress(&mut list, &id, at);
+                        }
                         save_books(&list);
                         books.set(list);
                     }
@@ -298,35 +187,32 @@ pub fn App() -> impl IntoElement {
                                         .add_filter("PDF", &["pdf"])
                                         .pick_file()
                                     {
-                                        let source = file.to_string_lossy().into_owned();
-                                        path.set(source.clone());
-                                        match render(&source, 0, dark.get()) {
+                                        match import_pdf(&file) {
+                                            Ok(book) => match render(&book.path, book.last_page, dark.get()) {
                                             Ok(result) => {
                                                 let mut list = books.get();
-                                                let book = Book {
-                                                    title: title(&source),
-                                                    path: source,
-                                                    pages: result.count,
-                                                    last_page: 0,
-                                                };
                                                 if !list.iter().any(|b| b.path == book.path) {
-                                                    list.push(book);
-                                                    save_books(&list);
-                                                    books.set(list.clone());
+                                                    list.push(book.clone());
                                                 }
+                                                save_books(&list);
+                                                books.set(list.clone());
                                                 let i = list
                                                     .iter()
                                                     .position(|b| b.path == path.get())
+                                                    .or_else(|| list.iter().position(|b| b.id == book.id))
                                                     .unwrap_or(0);
+                                                path.set(book.path.clone());
                                                 selected.set(Some(i));
                                                 count.set(result.count);
-                                                page.set(0);
+                                                page.set(book.last_page);
                                                 image_path.set(result.png);
                                                 image_size.set(result.size);
                                                 extracted.set(result.text);
                                                 outline.set(result.toc);
                                                 error.set(String::new());
                                             }
+                                            Err(message) => error.set(message),
+                                            },
                                             Err(message) => error.set(message),
                                         }
                                     }
@@ -390,6 +276,17 @@ pub fn App() -> impl IntoElement {
                                     let open_page = load_first.clone();
                                     let previous_page = load_prev.clone();
                                     let next_page = load_next.clone();
+                        let mut toc_entries = view().flex_col().gap_1();
+                        for (title, at, depth) in outline.get() {
+                            let jump = load_first.clone();
+                            toc_entries = toc_entries.child(
+                                button().on_press(move || jump(at)).child(text(format!(
+                                    "{}{}",
+                                    "  ".repeat(depth.min(8)),
+                                    title
+                                ))),
+                            );
+                        }
                                     return view()
                                         .flex_1()
                                         .flex_col()
@@ -487,23 +384,7 @@ pub fn App() -> impl IntoElement {
                                                                 .text_size(px(16.0))
                                                                 .font_weight(FontWeight::SEMIBOLD),
                                                         )
-                                                        .child(
-                                                            text(move || {
-                                                                outline
-                                                                    .get()
-                                                                    .iter()
-                                                                    .map(|(title, page)| {
-                                                                        format!(
-                                                                            "{}  ·  стр. {}",
-                                                                            title,
-                                                                            page + 1
-                                                                        )
-                                                                    })
-                                                                    .collect::<Vec<_>>()
-                                                                    .join("\n")
-                                                            })
-                                                            .text_size(px(12.0)),
-                                                        )
+                                                        .child(toc_entries)
                                                         .child(
                                                             text("Текст страницы")
                                                                 .text_size(px(12.0))
@@ -529,15 +410,25 @@ pub fn App() -> impl IntoElement {
                             }
                             let list = books.get();
                             let mut shelf = view().flex_row().flex_wrap().gap_5();
-                            for (i, book) in list.iter().enumerate() {
+                            let visible = search_books(&list, &query.get());
+                            let message = if list.is_empty() {
+                                "Добавьте PDF, чтобы начать читать"
+                            } else if visible.is_empty() {
+                                "Ничего не найдено"
+                            } else {
+                                ""
+                            };
+                            for book in visible {
+                                let i = list
+                                    .iter()
+                                    .position(|candidate| candidate.path == book.path)
+                                    .unwrap_or(0);
                                 let name = book.title.clone();
+                                let author = book.author.clone();
                                 let page_count = book.pages;
                                 let last_page = book.last_page;
-                                let progress = if page_count <= 1 {
-                                    0.0
-                                } else {
-                                    last_page.min(page_count - 1) as f32 / (page_count - 1) as f32
-                                };
+                                let progress = book.progress();
+                                let cover = book.cover.clone();
                                 let source = book.path.clone();
                                 let open_book = load_first.clone();
                                 shelf = shelf.child(
@@ -567,21 +458,21 @@ pub fn App() -> impl IntoElement {
                                                         .flex_col()
                                                         .items_center()
                                                         .justify_center()
-                                                        .child(
-                                                            text("▤")
-                                                                .text_size(px(48.0))
-                                                                .text_color(move || {
-                                                                    rgb(if dark.get() {
-                                                                        0xB7B7C0
-                                                                    } else {
-                                                                        LIBER_ACCENT
-                                                                    })
-                                                                }),
-                                                        )
-                                                        .child(text("PDF").text_size(px(11.0))),
+                                                        .child(dynamic(move || {
+                                                            if cover.is_empty() {
+                                                                view().h(px(226.0)).w(px(176.0)).flex_col().items_center().justify_center()
+                                                                    .child(text("▤").text_size(px(48.0)).text_color(move || rgb(if dark.get() { 0xB7B7C0 } else { LIBER_ACCENT })))
+                                                                    .child(text("PDF").text_size(px(11.0))).into_element()
+                                                            } else {
+                                                                image(cover.clone()).w(px(176.0)).h(px(226.0)).into_element()
+                                                            }
+                                                        })),
                                                 ),
                                         )
                                         .child(text(name).text_size(px(14.0)))
+                                        .child(text(author).text_size(px(12.0)).text_color(move || {
+                                            rgb(if dark.get() { 0xA0A0A8 } else { 0x77777D })
+                                        }))
                                         .child(
                                             text(format!(
                                                 "{} страниц · стр. {}",
@@ -610,11 +501,6 @@ pub fn App() -> impl IntoElement {
                                         ),
                                 );
                             }
-                            let message = if list.is_empty() {
-                                "Добавьте PDF, чтобы начать читать"
-                            } else {
-                                ""
-                            };
                             view()
                                 .flex_1()
                                 .px(px(32.0))
@@ -624,6 +510,12 @@ pub fn App() -> impl IntoElement {
                                     text("Читаю сейчас")
                                         .text_size(px(20.0))
                                         .font_weight(FontWeight::SEMIBOLD),
+                                )
+                                .child(
+                                    input()
+                                        .value(move || query.get())
+                                        .placeholder("Поиск по названию или автору")
+                                        .on_change(move |value: &str| query.set(value.to_owned())),
                                 )
                                 .child(text("Недавно добавленные").text_size(px(13.0)).text_color(
                                     move || rgb(if dark.get() { 0xA0A0A8 } else { 0x77777D }),

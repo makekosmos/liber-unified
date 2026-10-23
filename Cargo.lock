@@ -1726,16 +1726,24 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 name = "liber"
 version = "0.2.0"
 dependencies = [
- "dirs",
  "env_logger",
- "hayro",
- "image",
+ "liber-core",
  "nsh-base",
  "nsh-core",
  "nsh-platform-linux",
  "nsh-platform-macos",
  "nsh-platform-windows",
  "rfd",
+ "serde_json",
+]
+
+[[package]]
+name = "liber-core"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "hayro",
+ "image",
  "serde",
  "serde_json",
 ]

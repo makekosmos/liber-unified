@@ -5,17 +5,17 @@ edition = "2024"
 publish = false
 
 [workspace]
+members = ["crates/liber-core"]
+default-members = [".", "crates/liber-core"]
+resolver = "3"
 
 [dependencies]
 nsh-core = "0.2.0"
 nsh-base = "0.2.0"
-hayro = "0.8.0"
-image = { version = "0.25", default-features = false, features = ["png"] }
 env_logger = "0.11"
-serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-dirs = "6"
 rfd = "0.15"
+liber-core = { path = "crates/liber-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nsh-platform-linux = { version = "0.2.0", default-features = false }
