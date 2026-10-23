@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::{Array, Dict, MaybeRef, Name, ObjRef, Object, ObjectIdentifier};
+use hayro::hayro_syntax::Pdf;
 
 /// Upper bound on outline nodes, so a cyclic or hostile outline cannot hang the walk.
 const MAX_OUTLINE: usize = 20_000;
@@ -47,7 +47,10 @@ fn ident(r: ObjRef) -> ObjectIdentifier {
 /// of PDFDocEncoding (exact for ASCII, which is enough for this report).
 pub fn decode_text(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
         return String::from_utf16_lossy(&units);
     }
     if let Ok(text) = std::str::from_utf8(bytes) {
@@ -62,10 +65,16 @@ fn root(pdf: &Pdf) -> Option<Dict<'_>> {
 
 /// Resolve a destination (explicit array, or a name looked up in the name tree)
 /// to a page index.
-fn dest_page(pdf: &Pdf, index: &HashMap<ObjectIdentifier, usize>, dest: Object<'_>) -> Option<usize> {
+fn dest_page(
+    pdf: &Pdf,
+    index: &HashMap<ObjectIdentifier, usize>,
+    dest: Object<'_>,
+) -> Option<usize> {
     match dest {
         Object::Array(arr) => explicit_page(index, &arr),
-        Object::Dict(d) => d.get::<Array<'_>>("D").and_then(|a| explicit_page(index, &a)),
+        Object::Dict(d) => d
+            .get::<Array<'_>>("D")
+            .and_then(|a| explicit_page(index, &a)),
         Object::Name(n) => named_dest(pdf, index, n.as_ref()),
         Object::String(s) => named_dest(pdf, index, s.as_bytes()),
         _ => None,
@@ -122,9 +131,15 @@ fn name_tree_lookup<'a>(node: &Dict<'a>, key: &[u8], depth: usize) -> Option<Obj
 
 /// Debug helper: describes the raw /Dest (or /A) of the first outline item.
 pub fn debug_first_dest(pdf: &Pdf) -> String {
-    let Some(root) = root(pdf) else { return "no root".into() };
-    let Some(outlines) = root.get::<Dict<'_>>("Outlines") else { return "no outlines".into() };
-    let Some(first) = outlines.get::<Dict<'_>>("First") else { return "no First".into() };
+    let Some(root) = root(pdf) else {
+        return "no root".into();
+    };
+    let Some(outlines) = root.get::<Dict<'_>>("Outlines") else {
+        return "no outlines".into();
+    };
+    let Some(first) = outlines.get::<Dict<'_>>("First") else {
+        return "no First".into();
+    };
     let kind = |o: &Object<'_>| match o {
         Object::Array(_) => "array",
         Object::Dict(_) => "dict",
@@ -137,14 +152,25 @@ pub fn debug_first_dest(pdf: &Pdf) -> String {
         .get::<Dict<'_>>("A")
         .and_then(|a| a.get::<Object<'_>>("D"))
         .map(|d| kind(&d).to_owned());
-    let names_dests = root.get::<Dict<'_>>("Names").and_then(|n| n.get::<Dict<'_>>("Dests")).is_some();
+    let names_dests = root
+        .get::<Dict<'_>>("Names")
+        .and_then(|n| n.get::<Dict<'_>>("Dests"))
+        .is_some();
     let legacy = root.get::<Dict<'_>>("Dests").is_some();
-    let ids = pdf.pages().iter().take(3).map(|p| p.raw().obj_id().is_some()).collect::<Vec<_>>();
-    let array_first = first.get::<Object<'_>>("Dest").or_else(|| {
-        first.get::<Dict<'_>>("A")?.get::<Object<'_>>("D")
-    });
+    let ids = pdf
+        .pages()
+        .iter()
+        .take(3)
+        .map(|p| p.raw().obj_id().is_some())
+        .collect::<Vec<_>>();
+    let array_first = first
+        .get::<Object<'_>>("Dest")
+        .or_else(|| first.get::<Dict<'_>>("A")?.get::<Object<'_>>("D"));
     let arr_kind = match array_first {
-        Some(Object::Array(a)) => format!("{:?}", a.raw_iter().next().map(|m| matches!(m, MaybeRef::Ref(_)))),
+        Some(Object::Array(a)) => format!(
+            "{:?}",
+            a.raw_iter().next().map(|m| matches!(m, MaybeRef::Ref(_)))
+        ),
         _ => "-".into(),
     };
     format!("Dest={dest:?} A.D={action_d:?} NamesDests={names_dests} LegacyDests={legacy} page_ids={ids:?} firstElemIsRef={arr_kind}")
@@ -152,8 +178,12 @@ pub fn debug_first_dest(pdf: &Pdf) -> String {
 
 pub fn outline(pdf: &Pdf) -> Vec<TocEntry> {
     let index = page_index(pdf);
-    let Some(root) = root(pdf) else { return Vec::new() };
-    let Some(outlines) = root.get::<Dict<'_>>("Outlines") else { return Vec::new() };
+    let Some(root) = root(pdf) else {
+        return Vec::new();
+    };
+    let Some(outlines) = root.get::<Dict<'_>>("Outlines") else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     if let Some(first) = outlines.get::<Dict<'_>>("First") {
         walk(pdf, &index, first, 0, &mut out);
@@ -186,7 +216,11 @@ fn walk(
                 let dest = action.get::<Object<'_>>("D")?;
                 dest_page(pdf, index, dest)
             });
-        out.push(TocEntry { title: title.trim().to_owned(), page, depth });
+        out.push(TocEntry {
+            title: title.trim().to_owned(),
+            page,
+            depth,
+        });
         if let Some(child) = node.get::<Dict<'_>>("First") {
             walk(pdf, index, child, depth + 1, out);
         }
@@ -241,7 +275,8 @@ fn collect_label_ranges<'a>(node: &Dict<'a>, out: &mut Vec<(usize, Dict<'a>)>, d
     if let Some(nums) = node.get::<Array<'a>>("Nums") {
         let items: Vec<Object<'a>> = nums.iter::<Object<'a>>().collect();
         for pair in items.chunks_exact(2) {
-            if let (Some(n), Some(d)) = (pair[0].clone().into_number(), pair[1].clone().into_dict()) {
+            if let (Some(n), Some(d)) = (pair[0].clone().into_number(), pair[1].clone().into_dict())
+            {
                 out.push((n.as_f32().max(0.0) as usize, d));
             }
         }
@@ -255,8 +290,19 @@ fn collect_label_ranges<'a>(node: &Dict<'a>, out: &mut Vec<(usize, Dict<'a>)>, d
 
 fn roman(mut n: usize) -> String {
     const TABLE: [(usize, &str); 13] = [
-        (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
-        (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
     ];
     let mut out = String::new();
     for (value, sym) in TABLE {
@@ -277,21 +323,38 @@ fn letters(n: usize) -> String {
 /// Link annotations of one page. Only links with a page destination or a URI are kept.
 pub fn links(pdf: &Pdf, page: usize) -> Vec<Link> {
     let index = page_index(pdf);
-    let Some(p) = pdf.pages().get(page) else { return Vec::new() };
-    let Some(annots) = p.raw().get::<Array<'_>>("Annots") else { return Vec::new() };
+    let Some(p) = pdf.pages().get(page) else {
+        return Vec::new();
+    };
+    let Some(annots) = p.raw().get::<Array<'_>>("Annots") else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for annot in annots.iter::<Dict<'_>>() {
-        if annot.get::<Name<'_>>("Subtype").map(|n| n.as_ref().to_vec()).as_deref() != Some(b"Link") {
+        if annot
+            .get::<Name<'_>>("Subtype")
+            .map(|n| n.as_ref().to_vec())
+            .as_deref()
+            != Some(b"Link")
+        {
             continue;
         }
-        let Some(rect) = annot.get::<hayro::hayro_syntax::object::Rect>("Rect") else { continue };
+        let Some(rect) = annot.get::<hayro::hayro_syntax::object::Rect>("Rect") else {
+            continue;
+        };
         let target = if let Some(dest) = annot.get::<Object<'_>>("Dest") {
             dest_page(pdf, &index, dest).map_or(LinkTarget::Unresolved, LinkTarget::Page)
         } else if let Some(action) = annot.get::<Dict<'_>>("A") {
-            match action.get::<Name<'_>>("S").map(|n| n.as_ref().to_vec()).as_deref() {
+            match action
+                .get::<Name<'_>>("S")
+                .map(|n| n.as_ref().to_vec())
+                .as_deref()
+            {
                 Some(b"URI") => action
                     .get::<hayro::hayro_syntax::object::String<'_>>("URI")
-                    .map_or(LinkTarget::Unresolved, |s| LinkTarget::Uri(decode_text(s.as_bytes()))),
+                    .map_or(LinkTarget::Unresolved, |s| {
+                        LinkTarget::Uri(decode_text(s.as_bytes()))
+                    }),
                 Some(b"GoTo") => action
                     .get::<Object<'_>>("D")
                     .and_then(|d| dest_page(pdf, &index, d))
@@ -301,7 +364,10 @@ pub fn links(pdf: &Pdf, page: usize) -> Vec<Link> {
         } else {
             LinkTarget::Unresolved
         };
-        out.push(Link { rect: [rect.x0, rect.y0, rect.x1, rect.y1], target });
+        out.push(Link {
+            rect: [rect.x0, rect.y0, rect.x1, rect.y1],
+            target,
+        });
     }
     out
 }

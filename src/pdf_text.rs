@@ -2,10 +2,10 @@
 //! recorded; every drawing call is ignored.
 
 use hayro::hayro_interpret::font::{Glyph as FontGlyph, GlyphRun};
+use hayro::hayro_interpret::hayro_cmap::BfString;
 use hayro::hayro_interpret::{
     BlendMode, ClipPath, Device, DrawMode, DrawProps, Image, ImageDrawProps, SoftMask,
 };
-use hayro::hayro_interpret::hayro_cmap::BfString;
 use hayro::kurbo::BezPath;
 
 #[derive(Debug, Clone)]

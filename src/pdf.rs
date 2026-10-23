@@ -1,6 +1,5 @@
-//! PDF access through MuPDF: metadata probe, cover thumbnails and a render
-//! worker. MuPDF documents are not `Send`, so the worker thread opens its own
-//! document and talks to the UI over channels.
+//! PDF access through hayro: metadata probe, cover thumbnails, page rendering,
+//! text extraction and a worker that talks to the UI over channels.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -8,7 +7,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use hayro::hayro_interpret::util::TransformExt;
-use hayro::hayro_interpret::{Context, InterpreterCache, InterpreterSettings, interpret_page};
+use hayro::hayro_interpret::{interpret_page, Context, InterpreterCache, InterpreterSettings};
 use hayro::hayro_syntax::Pdf as Document;
 use hayro::kurbo::Rect;
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -46,10 +45,27 @@ pub fn probe(path: &Path) -> Result<Meta, String> {
         return Err("в файле нет страниц".into());
     }
     Ok(Meta {
-        title: doc.metadata().title.as_deref().map(nav::decode_text).and_then(clean),
-        author: doc.metadata().author.as_deref().map(nav::decode_text).and_then(clean),
+        title: doc
+            .metadata()
+            .title
+            .as_deref()
+            .map(nav::decode_text)
+            .and_then(clean),
+        author: doc
+            .metadata()
+            .author
+            .as_deref()
+            .map(nav::decode_text)
+            .and_then(clean),
         pages: pages as u32,
     })
+}
+
+/// Return PDF page labels (`i`, `1`, `A-1`, …), with one-based numeric labels
+/// when the document does not define a label tree.
+pub fn page_labels(path: &Path) -> Result<Vec<String>, String> {
+    let doc = open(path)?;
+    Ok(nav::page_labels(&doc))
 }
 
 /// Render page 0 as a PNG that fits `width_px` pixels across.
@@ -59,9 +75,23 @@ pub fn save_cover(pdf: &Path, png: &Path, width_px: f32) -> Result<(), String> {
     let (w, _) = page.render_dimensions();
     let scale = width_px / f32::from(w).max(1.0);
     let cache = RenderCache::new();
-    let pixmap = hayro::render(page, &cache, &InterpreterSettings::default(), &RenderSettings::default(),
-        &PixmapSettings { x_scale: scale, y_scale: scale, bg_color: WHITE });
-    let image = image::RgbaImage::from_raw(u32::from(pixmap.width()), u32::from(pixmap.height()), pixmap.data_as_u8_slice().to_vec()).ok_or("hayro вернул некорректный буфер")?;
+    let pixmap = hayro::render(
+        page,
+        &cache,
+        &InterpreterSettings::default(),
+        &RenderSettings::default(),
+        &PixmapSettings {
+            x_scale: scale,
+            y_scale: scale,
+            bg_color: WHITE,
+        },
+    );
+    let image = image::RgbaImage::from_raw(
+        u32::from(pixmap.width()),
+        u32::from(pixmap.height()),
+        pixmap.data_as_u8_slice().to_vec(),
+    )
+    .ok_or("hayro вернул некорректный буфер")?;
     image.save(png).map_err(|e| e.to_string())
 }
 
@@ -130,16 +160,16 @@ pub struct Rendered {
 fn to_bgra(width: usize, height: usize, samples: &[u8], tone: Tone) -> Rendered {
     let mut bgra = Vec::with_capacity(width * height * 4);
     for px in samples.chunks_exact(4).take(width * height) {
-            let (r, g, b) = (px[0], px[1], px[2]);
-            let (r, g, b) = match tone {
-                Tone::Day => (r, g, b),
-                // Multiply by the paper colour: white becomes cream, ink stays dark.
-                Tone::Sepia => (mul(r, 0xF4), mul(g, 0xEC), mul(b, 0xD8)),
-                Tone::Night => (mul(255 - r, 0xDD), mul(255 - g, 0xDD), mul(255 - b, 0xD6)),
-                // Inverted, lifted off black onto the gray paper.
-                Tone::Gray => (lift(255 - r), lift(255 - g), lift(255 - b)),
-            };
-            bgra.extend_from_slice(&[b, g, r, 255]);
+        let (r, g, b) = (px[0], px[1], px[2]);
+        let (r, g, b) = match tone {
+            Tone::Day => (r, g, b),
+            // Multiply by the paper colour: white becomes cream, ink stays dark.
+            Tone::Sepia => (mul(r, 0xF4), mul(g, 0xEC), mul(b, 0xD8)),
+            Tone::Night => (mul(255 - r, 0xDD), mul(255 - g, 0xDD), mul(255 - b, 0xD6)),
+            // Inverted, lifted off black onto the gray paper.
+            Tone::Gray => (lift(255 - r), lift(255 - g), lift(255 - b)),
+        };
+        bgra.extend_from_slice(&[b, g, r, 255]);
     }
     Rendered {
         width: width as u32,
@@ -464,62 +494,173 @@ fn next_work(shared: &SharedWork) -> Option<Request> {
 }
 
 fn load_opened(doc: &Document) -> Result<Opened, String> {
-    let sizes = doc.pages().iter().map(|p| { let (w,h)=p.render_dimensions(); (f32::from(w).max(1.0), f32::from(h).max(1.0)) }).collect();
-    let toc = nav::outline(doc).into_iter().map(|e| TocEntry { title:e.title, page:e.page.map(|p| p as u32), depth:e.depth.min(u8::MAX as usize) as u8 }).collect();
+    let sizes = doc
+        .pages()
+        .iter()
+        .map(|p| {
+            let (w, h) = p.render_dimensions();
+            (f32::from(w).max(1.0), f32::from(h).max(1.0))
+        })
+        .collect();
+    let toc = nav::outline(doc)
+        .into_iter()
+        .map(|e| TocEntry {
+            title: e.title,
+            page: e.page.map(|p| p as u32),
+            depth: e.depth.min(u8::MAX as usize) as u8,
+        })
+        .collect();
     Ok(Opened { sizes, toc })
 }
 
 fn extract_text(doc: &Document, page: u32) -> Result<PageText, String> {
-    let page_ref = doc.pages().get(page as usize).ok_or("страница вне диапазона")?;
-    let (w,h)=page_ref.render_dimensions();
-    let cache=InterpreterCache::new();
-    let transform=page_ref.initial_transform(true).to_kurbo();
-    let mut ctx=Context::new(transform, Rect::new(0.0,0.0,f64::from(w),f64::from(h)), &cache, page_ref.xref(), InterpreterSettings::default());
-    let mut device=text::TextDevice::default();
-    interpret_page(page_ref,&mut ctx,&mut device);
+    let page_ref = doc
+        .pages()
+        .get(page as usize)
+        .ok_or("страница вне диапазона")?;
+    let (w, h) = page_ref.render_dimensions();
+    let cache = InterpreterCache::new();
+    let transform = page_ref.initial_transform(true).to_kurbo();
+    let mut ctx = Context::new(
+        transform,
+        Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
+        &cache,
+        page_ref.xref(),
+        InterpreterSettings::default(),
+    );
+    let mut device = text::TextDevice::default();
+    interpret_page(page_ref, &mut ctx, &mut device);
     let mut chars = Vec::new();
-    let mut line_no=0u32;
-    let mut last_y=None;
+    let mut line_no = 0u32;
+    let mut last_y = None;
     for g in &device.glyphs {
-        if g.text.is_empty() { continue; }
-        if last_y.is_some_and(|y:f64| (g.y-y).abs()>g.size.max(1.0)*0.5) { line_no+=1; }
-        last_y=Some(g.y);
-        let width=g.advance.max(g.size*0.25);
+        if g.text.is_empty() {
+            continue;
+        }
+        if last_y.is_some_and(|y: f64| (g.y - y).abs() > g.size.max(1.0) * 0.5) {
+            line_no += 1;
+        }
+        last_y = Some(g.y);
+        let width = g.advance.max(g.size * 0.25);
         for c in g.text.chars() {
-            chars.push(Ch { c, r:[g.x as f32,(g.y-g.size*0.8) as f32,(g.x+width) as f32,g.y as f32], line:line_no });
+            chars.push(Ch {
+                c,
+                r: [
+                    g.x as f32,
+                    (g.y - g.size * 0.8) as f32,
+                    (g.x + width) as f32,
+                    g.y as f32,
+                ],
+                line: line_no,
+            });
         }
     }
-    let links=nav::links(doc,page as usize).into_iter().filter_map(|l| { let target=match l.target { nav::LinkTarget::Page(p)=>LinkTarget::Page(p as u32), nav::LinkTarget::Uri(s)=>LinkTarget::Uri(s), nav::LinkTarget::Unresolved=>return None }; Some(PageLink {r:[l.rect[0] as f32,l.rect[1] as f32,l.rect[2] as f32,l.rect[3] as f32],target}) }).collect();
+    let links = nav::links(doc, page as usize)
+        .into_iter()
+        .filter_map(|l| {
+            let target = match l.target {
+                nav::LinkTarget::Page(p) => LinkTarget::Page(p as u32),
+                nav::LinkTarget::Uri(s) => LinkTarget::Uri(s),
+                nav::LinkTarget::Unresolved => return None,
+            };
+            Some(PageLink {
+                r: [
+                    l.rect[0] as f32,
+                    l.rect[1] as f32,
+                    l.rect[2] as f32,
+                    l.rect[3] as f32,
+                ],
+                target,
+            })
+        })
+        .collect();
     Ok(PageText { chars, links })
 }
 
 fn extract_plain(doc: &Document, page: u32) -> Result<String, String> {
-    let page_ref=doc.pages().get(page as usize).ok_or("страница вне диапазона")?;
-    let (w,h)=page_ref.render_dimensions(); let cache=InterpreterCache::new();
-    let mut ctx=Context::new(page_ref.initial_transform(true).to_kurbo(),Rect::new(0.0,0.0,f64::from(w),f64::from(h)),&cache,page_ref.xref(),InterpreterSettings::default());
-    let mut device=text::TextDevice::default(); interpret_page(page_ref,&mut ctx,&mut device);
+    let page_ref = doc
+        .pages()
+        .get(page as usize)
+        .ok_or("страница вне диапазона")?;
+    let (w, h) = page_ref.render_dimensions();
+    let cache = InterpreterCache::new();
+    let mut ctx = Context::new(
+        page_ref.initial_transform(true).to_kurbo(),
+        Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
+        &cache,
+        page_ref.xref(),
+        InterpreterSettings::default(),
+    );
+    let mut device = text::TextDevice::default();
+    interpret_page(page_ref, &mut ctx, &mut device);
     Ok(text::to_lines(&device.glyphs))
 }
 
-/// Return freed MuPDF memory to the OS (macOS keeps it in the malloc zone).
-fn relieve_memory() {}
+/// hayro owns the active document data; there is no process-global store to trim.
+/// The worker calls this after dropping/reopening documents to keep its lifecycle explicit.
+fn relieve_memory() {
+    // TODO: measure hayro's retained allocations on long documents before adding cache controls.
+}
 
 fn extract_flow(doc: &Document, page: u32) -> Result<Vec<Para>, String> {
-    let page_ref=doc.pages().get(page as usize).ok_or("страница вне диапазона")?;
-    let (w,h)=page_ref.render_dimensions(); let height=f32::from(h);
-    let cache=InterpreterCache::new();
-    let mut ctx=Context::new(page_ref.initial_transform(true).to_kurbo(),Rect::new(0.0,0.0,f64::from(w),f64::from(h)),&cache,page_ref.xref(),InterpreterSettings::default());
-    let mut device=text::TextDevice::default(); interpret_page(page_ref,&mut ctx,&mut device);
-    if device.glyphs.iter().all(|g|g.text.is_empty()) { return Ok(Vec::new()); }
-    let mut rows: Vec<Vec<&text::Glyph>>=Vec::new();
-    let mut glyphs:Vec<_>=device.glyphs.iter().filter(|g|!g.text.is_empty()).collect();
-    glyphs.sort_by(|a,b|a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
-    for g in glyphs { if let Some(row)=rows.last_mut().filter(|row|(row[0].y-g.y).abs()<g.size.max(1.0)*0.5) {row.push(g)} else {rows.push(vec![g])} }
-    let lines:Vec<String>=rows.iter().map(|row| {let refs:Vec<_>=row.iter().map(|g|(*g).clone()).collect(); text::to_lines(&refs)}).collect();
-    let size=device.glyphs.iter().map(|g|g.size as f32).sum::<f32>()/device.glyphs.len().max(1) as f32;
-    let blocks=vec![RawBlock {lines,size,y0:0.0,y1:height,line_bounds:Vec::new(),mono:false,indents:Vec::new()}];
+    let page_ref = doc
+        .pages()
+        .get(page as usize)
+        .ok_or("страница вне диапазона")?;
+    let (w, h) = page_ref.render_dimensions();
+    let height = f32::from(h);
+    let cache = InterpreterCache::new();
+    let mut ctx = Context::new(
+        page_ref.initial_transform(true).to_kurbo(),
+        Rect::new(0.0, 0.0, f64::from(w), f64::from(h)),
+        &cache,
+        page_ref.xref(),
+        InterpreterSettings::default(),
+    );
+    let mut device = text::TextDevice::default();
+    interpret_page(page_ref, &mut ctx, &mut device);
+    if device.glyphs.iter().all(|g| g.text.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let mut rows: Vec<Vec<&text::Glyph>> = Vec::new();
+    let mut glyphs: Vec<_> = device
+        .glyphs
+        .iter()
+        .filter(|g| !g.text.is_empty())
+        .collect();
+    glyphs.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+    for g in glyphs {
+        if let Some(row) = rows
+            .last_mut()
+            .filter(|row| (row[0].y - g.y).abs() < g.size.max(1.0) * 0.5)
+        {
+            row.push(g)
+        } else {
+            rows.push(vec![g])
+        }
+    }
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let refs: Vec<_> = row.iter().map(|g| (*g).clone()).collect();
+            text::to_lines(&refs)
+        })
+        .collect();
+    let size = device.glyphs.iter().map(|g| g.size as f32).sum::<f32>()
+        / device.glyphs.len().max(1) as f32;
+    let blocks = vec![RawBlock {
+        lines,
+        size,
+        y0: 0.0,
+        y1: height,
+        line_bounds: Vec::new(),
+        mono: false,
+        indents: Vec::new(),
+    }];
     let mut paras = flow::paragraphs(&blocks, height);
-    for para in &mut paras { para.repair(&flow::Vocab::default()); }
+    for para in &mut paras {
+        para.repair(&flow::Vocab::default());
+    }
     Ok(paras)
 }
 
@@ -551,21 +692,47 @@ struct Rasterizer;
 
 impl Rasterizer {
     fn render(&mut self, doc: &Document, key: RasterKey) -> Result<Rendered, String> {
-        let page=doc.pages().get(key.page as usize).ok_or("страница вне диапазона")?;
+        let page = doc
+            .pages()
+            .get(key.page as usize)
+            .ok_or("страница вне диапазона")?;
         if page.raw().contains_key("Contents") && page.page_stream().is_none() {
             return Err("page content stream could not be parsed".into());
         }
-        let scale=key.factor(); let cache=RenderCache::new();
-        let pixmap=hayro::render(page,&cache,&InterpreterSettings::default(),&RenderSettings::default(),&PixmapSettings{x_scale:scale,y_scale:scale,bg_color:WHITE});
-        let (w,h)=(u32::from(pixmap.width()),u32::from(pixmap.height()));
-        let rgba=pixmap.data_as_u8_slice();
-        let full=to_bgra(w as usize,h as usize,rgba,key.tone);
-        if let Some(t)=key.tile {
-            let x=t.x.min(w); let y=t.y.min(h); let tw=t.width.min(w-x); let th=t.height.min(h-y);
-            let mut bgra=Vec::with_capacity(tw as usize*th as usize*4);
-            for row in y..y+th { let start=((row*w+x)*4) as usize; bgra.extend_from_slice(&full.bgra[start..start+(tw*4) as usize]); }
-            Ok(Rendered{width:tw,height:th,bgra})
-        } else { Ok(full) }
+        let scale = key.factor();
+        let cache = RenderCache::new();
+        let pixmap = hayro::render(
+            page,
+            &cache,
+            &InterpreterSettings::default(),
+            &RenderSettings::default(),
+            &PixmapSettings {
+                x_scale: scale,
+                y_scale: scale,
+                bg_color: WHITE,
+            },
+        );
+        let (w, h) = (u32::from(pixmap.width()), u32::from(pixmap.height()));
+        let rgba = pixmap.data_as_u8_slice();
+        let full = to_bgra(w as usize, h as usize, rgba, key.tone);
+        if let Some(t) = key.tile {
+            let x = t.x.min(w);
+            let y = t.y.min(h);
+            let tw = t.width.min(w - x);
+            let th = t.height.min(h - y);
+            let mut bgra = Vec::with_capacity(tw as usize * th as usize * 4);
+            for row in y..y + th {
+                let start = ((row * w + x) * 4) as usize;
+                bgra.extend_from_slice(&full.bgra[start..start + (tw * 4) as usize]);
+            }
+            Ok(Rendered {
+                width: tw,
+                height: th,
+                bgra,
+            })
+        } else {
+            Ok(full)
+        }
     }
 }
 
@@ -863,28 +1030,58 @@ pub(crate) mod test_pdf {
 mod tests {
     #[test]
     fn real_book_source_lines_and_technical_text() {
-        let Some(path) = std::env::var_os("LIBER_TEST_PDF").map(std::path::PathBuf::from) else { return };
+        let Some(path) = std::env::var_os("LIBER_TEST_PDF").map(std::path::PathBuf::from) else {
+            return;
+        };
         let doc = super::open(&path).unwrap();
         let paras = super::extract_flow(&doc, 48).unwrap();
         assert!(paras.iter().any(|p| p.text.contains("IEEE 754")));
         assert!(paras.iter().any(|p| p.text.contains("var")));
         for p in &paras {
             for line in &p.source {
-                assert!(p.text.is_char_boundary(line.start), "bad start {line:?}: {}", p.text);
-                assert!(p.text.is_char_boundary(line.end), "bad end {line:?}: {}", p.text);
+                assert!(
+                    p.text.is_char_boundary(line.start),
+                    "bad start {line:?}: {}",
+                    p.text
+                );
+                assert!(
+                    p.text.is_char_boundary(line.end),
+                    "bad end {line:?}: {}",
+                    p.text
+                );
             }
         }
-        let codes: Vec<_> = (49..53).flat_map(|page| super::extract_flow(&doc, page).unwrap())
-            .filter(|p| p.kind == crate::flow::Kind::Code).collect();
+        let codes: Vec<_> = (49..53)
+            .flat_map(|page| super::extract_flow(&doc, page).unwrap())
+            .filter(|p| p.kind == crate::flow::Kind::Code)
+            .collect();
         let numeric_page = super::extract_flow(&doc, 49).unwrap();
-        assert!(numeric_page.iter().any(|p| p.text.starts_with("3.2.1.") && p.kind == crate::flow::Kind::Heading(3)));
+        assert!(numeric_page
+            .iter()
+            .any(|p| p.text.starts_with("3.2.1.") && p.kind == crate::flow::Kind::Heading(3)));
         assert!(!codes.is_empty());
-        assert!(codes.iter().any(|p| p.text.contains("0b10101")), "binary OCR must agree with => 21");
-        assert!(codes.iter().any(|p| p.text.contains("0o377")), "octal OCR must agree with => 255");
-        assert!(codes.iter().any(|p| p.text.starts_with("0\n3\n")), "numeric OCR column must stay multiline");
-        assert!(codes.iter().any(|p| p.syntax.iter().any(|s| s.token == crate::syntax::Token::Comment)));
-        println!("Technical page: {} paragraphs, {} source lines; {} code blocks on pages 50–53",
-            paras.len(), paras.iter().map(|p| p.source.len()).sum::<usize>(), codes.len());
+        assert!(
+            codes.iter().any(|p| p.text.contains("0b10101")),
+            "binary OCR must agree with => 21"
+        );
+        assert!(
+            codes.iter().any(|p| p.text.contains("0o377")),
+            "octal OCR must agree with => 255"
+        );
+        assert!(
+            codes.iter().any(|p| p.text.starts_with("0\n3\n")),
+            "numeric OCR column must stay multiline"
+        );
+        assert!(codes.iter().any(|p| p
+            .syntax
+            .iter()
+            .any(|s| s.token == crate::syntax::Token::Comment)));
+        println!(
+            "Technical page: {} paragraphs, {} source lines; {} code blocks on pages 50–53",
+            paras.len(),
+            paras.iter().map(|p| p.source.len()).sum::<usize>(),
+            codes.len()
+        );
     }
     use super::*;
 
@@ -910,6 +1107,26 @@ mod tests {
         let path = std::env::temp_dir().join(format!("liber-pdf-{}-junk.pdf", std::process::id()));
         std::fs::write(&path, b"not a pdf at all").unwrap();
         assert!(probe(&path).is_err());
+    }
+
+    #[test]
+    fn renderer_rejects_unresolvable_content_instead_of_showing_white_page() {
+        let path = std::env::temp_dir().join(format!(
+            "liber-pdf-{}-broken-content.pdf",
+            std::process::id()
+        ));
+        let mut bytes = test_pdf::with_text("should not render");
+        let needle = b"/Contents 4 0 R";
+        let at = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap();
+        bytes[at + needle.len() - 5] = b'9';
+        std::fs::write(&path, bytes).unwrap();
+        let renderer = Renderer::spawn(path);
+        renderer.opened.recv().unwrap().unwrap();
+        renderer.request(0, 1.0, Tone::Day);
+        assert!(renderer.replies.recv().unwrap().image.is_err());
     }
 
     #[test]
