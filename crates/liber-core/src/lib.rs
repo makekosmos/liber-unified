@@ -46,6 +46,12 @@ pub struct Page {
     pub size: (u32, u32),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchHit {
+    pub page: usize,
+    pub excerpt: String,
+}
+
 pub fn default_root() -> PathBuf {
     if let Some(path) = std::env::var_os("LIBER_DATA_DIR") {
         return PathBuf::from(path);
@@ -218,9 +224,65 @@ pub fn render(path: impl AsRef<Path>, index: usize, dark: bool) -> Result<Page, 
     })
 }
 
+/// Search each page's text layer and return one short excerpt per matching page.
+pub fn search_pdf(path: impl AsRef<Path>, query: &str) -> Result<Vec<SearchHit>, String> {
+    let needle: Vec<char> = query.trim().chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let pdf = Pdf::new(bytes).map_err(|e| format!("Не удалось открыть PDF: {e:?}"))?;
+    let mut hits = Vec::new();
+    for (index, page) in pdf.pages().iter().enumerate() {
+        if page.raw().contains_key("Contents") && page.page_stream().is_none() {
+            continue;
+        }
+        let (width, height) = page.render_dimensions();
+        let cache = InterpreterCache::new();
+        let mut context = Context::new(
+            page.initial_transform(true).to_kurbo(),
+            Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
+            &cache,
+            page.xref(),
+            InterpreterSettings::default(),
+        );
+        let mut device = pdf_text::TextDevice::default();
+        interpret_page(page, &mut context, &mut device);
+        let text = pdf_text::to_lines(&device.glyphs);
+        let Some(excerpt) = find_excerpt(&text, &needle) else {
+            continue;
+        };
+        hits.push(SearchHit {
+            page: index,
+            excerpt,
+        });
+        if hits.len() >= 120 {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
+fn find_excerpt(text: &str, needle: &[char]) -> Option<String> {
+    if needle.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let lower: Vec<char> = chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
+    let at = lower
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    let from = at.saturating_sub(60);
+    let to = (at + needle.len() + 100).min(chars.len());
+    Some(chars[from..to].iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Book, search_books};
+    use super::{Book, find_excerpt, search_books};
     #[test]
     fn progress_is_clamped_and_handles_single_page_documents() {
         let mut book = Book {
@@ -264,5 +326,14 @@ mod tests {
         assert_eq!(search_books(&books, "FRONT").len(), 1);
         assert_eq!(search_books(&books, "ИВАН").len(), 1);
         assert!(search_books(&books, "missing").is_empty());
+    }
+
+    #[test]
+    fn pdf_search_excerpt_finds_unicode_case_insensitively() {
+        let query: Vec<char> = "ПЕРЕМЕННЫЕ".chars().flat_map(char::to_lowercase).collect();
+        let excerpt = find_excerpt("Текст книги: Переменные в JavaScript", &query).unwrap();
+        assert!(excerpt.contains("Переменные"));
+        assert!(find_excerpt("нет совпадения", &query).is_none());
+        assert!(find_excerpt("любой текст", &[]).is_none());
     }
 }

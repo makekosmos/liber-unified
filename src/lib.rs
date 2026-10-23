@@ -1,5 +1,7 @@
 //! Liber desktop app. The native UI and PDF reader share one application root.
-use liber_core::{import_pdf, load_books, render, save_books, search_books, set_progress};
+use liber_core::{
+    import_pdf, load_books, render, save_books, search_books, search_pdf, set_progress,
+};
 use nsh_base::{button, safe_area_view};
 use nsh_core::color::rgb;
 use nsh_core::ui::prelude::*;
@@ -31,6 +33,7 @@ fn save_dark(dark: bool) {
 
 #[native_module("liber/native")]
 fn native(registry: &mut Registry) {
+    registry.assets(assets!());
     registry.register::<App>();
 }
 
@@ -88,6 +91,9 @@ pub fn App() -> impl IntoElement {
     let image_size = signal(startup_size);
     let error = signal(String::new());
     let query = signal(String::new());
+    let document_query = signal(String::new());
+    let search_hits = signal(Vec::<liber_core::SearchHit>::new());
+    let text_mode = signal(false);
     let dark = signal(load_dark());
 
     let load = std::rc::Rc::new(move |at: usize| {
@@ -128,7 +134,7 @@ pub fn App() -> impl IntoElement {
     let bg = move || rgb(if dark.get() { 0x17171A } else { LIBER_BG });
     let fg = move || rgb(if dark.get() { 0xF2F2F7 } else { LIBER_INK });
 
-    view().flex_1().bg(bg).text_color(fg).child(
+    view().flex_1().font_family(asset!("fonts/Inter.ttf").family).bg(bg).text_color(fg).child(
         safe_area_view().flex_1().child(
             view()
                 .flex_1()
@@ -287,6 +293,18 @@ pub fn App() -> impl IntoElement {
                                 ))),
                             );
                         }
+                        let mut result_entries = view().flex_col().gap_1();
+                        for hit in search_hits.get() {
+                            let jump = load_first.clone();
+                            let at = hit.page;
+                            result_entries = result_entries.child(
+                                button().on_press(move || jump(at)).child(text(format!(
+                                    "{} · {}",
+                                    at + 1,
+                                    hit.excerpt
+                                )).text_size(px(11.0))),
+                            );
+                        }
                                     return view()
                                         .flex_1()
                                         .flex_col()
@@ -309,6 +327,11 @@ pub fn App() -> impl IntoElement {
                                                 )
                                                 .child(text(book.title.clone()).text_size(px(14.0)))
                                                 .child(view().flex_1())
+                                                .child(
+                                                    button()
+                                                        .on_press(move || text_mode.set(!text_mode.get()))
+                                                        .child(text(move || if text_mode.get() { "Страница" } else { "Текст" })),
+                                                )
                                                 .child(
                                                     button()
                                                         .on_press(move || {
@@ -345,27 +368,36 @@ pub fn App() -> impl IntoElement {
                                                 .flex_1()
                                                 .flex_row()
                                                 .min_h_0()
-                                                .child(
-                                                    scroll().flex_1().child(
-                                                        view()
-                                                            .flex_col()
-                                                            .items_center()
-                                                            .py(px(22.0))
-                                                            .child(dynamic(move || {
-                                                                let src = image_path.get();
-                                                                let (width, height) =
-                                                                    image_size.get();
-                                                                (!src.is_empty()).then(|| {
-                                                                    image(src)
-                                                                        .w(px(680.0))
-                                                                        .h(px(680.0
-                                                                            * height as f32
-                                                                            / width.max(1) as f32))
-                                                                        .max_w(px(820.0))
-                                                                })
-                                                            })),
-                                                    ),
-                                                )
+                                                .child(dynamic(move || {
+                                                    if text_mode.get() {
+                                                        scroll().flex_1().child(
+                                                            view().w_full().flex().justify_center().py(px(36.0)).child(
+                                                                text(move || extracted.get())
+                                                                    .max_w(px(700.0))
+                                                                    .font_family("Georgia")
+                                                                    .text_size(px(19.0))
+                                                                    .line_height(px(31.0)),
+                                                            ),
+                                                        ).into_element()
+                                                    } else {
+                                                        scroll().flex_1().child(
+                                                            view()
+                                                                .flex_col()
+                                                                .items_center()
+                                                                .py(px(22.0))
+                                                                .child(dynamic(move || {
+                                                                    let src = image_path.get();
+                                                                    let (width, height) = image_size.get();
+                                                                    (!src.is_empty()).then(|| {
+                                                                        image(src)
+                                                                            .w(px(680.0))
+                                                                            .h(px(680.0 * height as f32 / width.max(1) as f32))
+                                                                            .max_w(px(820.0))
+                                                                    })
+                                                                })),
+                                                        ).into_element()
+                                                    }
+                                                }))
                                                 .child(
                                                     view()
                                                         .w(px(300.0))
@@ -385,6 +417,27 @@ pub fn App() -> impl IntoElement {
                                                                 .font_weight(FontWeight::SEMIBOLD),
                                                         )
                                                         .child(toc_entries)
+                                                        .child(
+                                                            text("Поиск по книге")
+                                                                .text_size(px(13.0))
+                                                                .font_weight(FontWeight::SEMIBOLD),
+                                                        )
+                                                        .child(
+                                                            input()
+                                                                .value(move || document_query.get())
+                                                                .placeholder("Найти в PDF")
+                                                                .on_change(move |value: &str| {
+                                                                    document_query.set(value.to_owned());
+                                                                    match search_pdf(&path.get(), value) {
+                                                                        Ok(found) => {
+                                                                            search_hits.set(found);
+                                                                            error.set(String::new());
+                                                                        }
+                                                                        Err(message) => error.set(message),
+                                                                    }
+                                                                }),
+                                                        )
+                                                        .child(result_entries)
                                                         .child(
                                                             text("Текст страницы")
                                                                 .text_size(px(12.0))
