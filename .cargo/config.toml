@@ -1,0 +1,4 @@
+[env]
+# mupdf-sys falls back to v142 when its MSBuild version detector does not
+# recognize newer Visual Studio releases. Use the current MSVC toolset.
+MUPDF_MSVC_PLATFORM_TOOLSET = { value = "v143", force = false }

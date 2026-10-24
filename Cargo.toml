@@ -9,6 +9,9 @@ members = ["crates/liber-core"]
 default-members = [".", "crates/liber-core"]
 resolver = "3"
 
+[patch.crates-io]
+mupdf = { path = "crates/liber-core/vendor/mupdf" }
+
 [dependencies]
 nsh-core = "0.2.0"
 nsh-base = "0.2.0"
