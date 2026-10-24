@@ -1,6 +1,6 @@
 # Liber
 
-Desktop PDF library and reader built on NSH and hayro.
+Desktop PDF library and reader built on NSH and MuPDF.
 
 ## Run on Windows
 
