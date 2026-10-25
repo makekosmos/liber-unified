@@ -1,8 +1,6 @@
 name: GPUI native split checks
 
 on:
-  push:
-    branches: [feat/gpui-native-split]
   pull_request:
     branches: [feat/native-window]
   workflow_dispatch:
@@ -35,5 +33,5 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libcairo2-dev libfontconfig-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libpango1.0-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1
+          sudo apt-get install -y clang libgtk-4-dev libfontconfig-dev libglib2.0-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1
       - run: cargo check --locked --bin gpui_native_split_spike --target "${{ matrix.target }}"
