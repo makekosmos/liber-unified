@@ -306,7 +306,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
             *slot = Some(page);
         }
     }
-    let rendered_pages = signal(initial_pages.into_iter().map(signal).collect());
+    let rendered_pages: Signal<Vec<Signal<Option<liber_core::Page>>>> =
+        signal(initial_pages.into_iter().map(signal).collect());
     let mut initial_reading_pages = vec![None; startup_count];
     if let Some(slot) = initial_reading_pages.get_mut(startup_page) {
         *slot = Some(startup_text.clone());
@@ -329,6 +330,46 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let outline_sidebar_open = signal(true);
     let notes_sidebar_open = signal(false);
     let selection = signal(None::<SelectionDrag>);
+    let note_action_enabled = std::rc::Rc::new(move || {
+        !text_mode.get()
+            && selection.get().is_some_and(|drag| {
+                drag.is_drag()
+                    && rendered_pages
+                        .get()
+                        .get(drag.page)
+                        .and_then(|slot| slot.get())
+                        .is_some_and(|page| !page.page_text.chars.is_empty())
+            })
+    });
+    let save_selection_note = std::rc::Rc::new(move || {
+        let Some(drag) = selection.get() else { return; };
+        if !drag.is_drag() { return; }
+        let Some(rendered) = rendered_pages.get().get(drag.page).and_then(|slot| slot.get()) else { return; };
+        let page_text = rendered.page_text.clone();
+        let scale = READING_WIDTH_PT * zoom.get() / rendered.points.0;
+        if scale <= 0.0 { return; }
+        let Some(book_id) = books.get().iter()
+            .find(|book| book.path == path.get())
+            .map(|book| book.id.clone()) else { return; };
+        let root = liber_core::default_root();
+        spawn(async move {
+            let Some(measurement) = drag.page_ref.measure().await else { return; };
+            let origin = (measurement.page.x.0, measurement.page.y.0);
+            let local = |surface: (f32, f32)| {
+                ((surface.0 - origin.0) / scale, (surface.1 - origin.1) / scale)
+            };
+            let Some(highlight) = page_text.highlight(
+                drag.page as u32,
+                local(drag.start_surface),
+                local(drag.end_surface),
+            ) else { return; };
+            let mut notes = liber_core::notes::Notes::open(&root, &book_id);
+            notes.add(highlight);
+            notes_snapshot.set(notes.items);
+            notes_snapshot_book.set(Some(book_id));
+            selection.set(None);
+        });
+    });
 
     let pending_pages = signal(Vec::<usize>::new());
     let reader_pages = reader_pages::ReaderPages {
@@ -899,15 +940,6 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                 )).text_size(px(11.0))),
                             );
                         }
-                                    if notes_snapshot_book.get().as_deref() != Some(book.id.as_str()) {
-                                        notes_snapshot.set(
-                                            liber_core::notes::Notes::open(
-                                                &liber_core::default_root(),
-                                                &book.id,
-                                            ).items,
-                                        );
-                                        notes_snapshot_book.set(Some(book.id.clone()));
-                                    }
                                     let highlights = notes_snapshot.get();
                                     if reader_window {
                                         // The reader window's notes popover lists the highlights, like its contents.
@@ -1000,13 +1032,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
             let bar_previous = previous_page.clone();
             let bar_next = next_page.clone();
             let bar_title = book.title.clone();
-            let bar_selection = selection;
-            let bar_pages = rendered_pages;
-            let bar_notes_snapshot = notes_snapshot;
-            let bar_notes_snapshot_book = notes_snapshot_book;
-            let bar_books = books;
-            let bar_path = path;
-            let bar_zoom = zoom;
+            let bar_note_action_enabled = note_action_enabled.clone();
+            let bar_save_selection_note = save_selection_note.clone();
             let bar_row = std::rc::Rc::new(move || {
                 let bar_previous = bar_previous.clone();
                 let bar_next = bar_next.clone();
@@ -1123,47 +1150,13 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                 )
                                                 .child(
                                                     button()
-                                                        .disabled(move || {
-                                                            text_mode.get()
-                                                                || !bar_selection.get().is_some_and(|drag| {
-                                                                    drag.is_drag()
-                                                                        && bar_pages.get().get(drag.page)
-                                                                            .and_then(|slot| slot.get())
-                                                                            .is_some_and(|page| !page.page_text.chars.is_empty())
-                                                                })
+                                                        .disabled({
+                                                            let enabled = bar_note_action_enabled.clone();
+                                                            move || !enabled()
                                                         })
-                                                        .on_press(move || {
-                                                            let Some(drag) = bar_selection.get() else { return; };
-                                                            if !drag.is_drag() { return; }
-                                                            let Some(rendered) = bar_pages.get().get(drag.page).and_then(|slot| slot.get()) else { return; };
-                                                            let page_text = rendered.page_text.clone();
-                                                            let points_width = rendered.points.0;
-                                                            let scale = READING_WIDTH_PT * bar_zoom.get() / points_width;
-                                                            if scale <= 0.0 { return; }
-                                                            let Some(book_id) = bar_books.get().iter()
-                                                                .find(|book| book.path == bar_path.get())
-                                                                .map(|book| book.id.clone()) else { return; };
-                                                            let root = liber_core::default_root();
-                                                            let snapshot = bar_notes_snapshot;
-                                                            let snapshot_book = bar_notes_snapshot_book;
-                                                            let selection = bar_selection;
-                                                            spawn(async move {
-                                                                let Some(measurement) = drag.page_ref.measure().await else { return; };
-                                                                let origin = (measurement.page.x.0, measurement.page.y.0);
-                                                                let local = |surface: (f32, f32)| {
-                                                                    ((surface.0 - origin.0) / scale, (surface.1 - origin.1) / scale)
-                                                                };
-                                                                let Some(highlight) = page_text.highlight(
-                                                                    drag.page as u32,
-                                                                    local(drag.start_surface),
-                                                                    local(drag.end_surface),
-                                                                ) else { return; };
-                                                                let mut notes = liber_core::notes::Notes::open(&root, &book_id);
-                                                                notes.add(highlight);
-                                                                snapshot.set(notes.items);
-                                                                snapshot_book.set(Some(book_id));
-                                                                selection.set(None);
-                                                            });
+                                                        .on_press({
+                                                            let save = bar_save_selection_note.clone();
+                                                            move || save()
                                                         })
                                                         .child(text("Заметка")),
                                                 )
@@ -1182,6 +1175,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                     }
                                     return view()
                                         .flex_1()
+                                        .relative()
                                         .flex_col()
                                         .bg(move || rgb(reader_tone_color(tone.get(), dark.get())))
                                         .child(reader_window.then(|| view()
@@ -1459,6 +1453,18 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                             ),
                                                         ).into_element()
                                                 ))
+                                                .child(reader_window.then(|| {
+                                                    let enabled = note_action_enabled.clone();
+                                                    let save = save_selection_note.clone();
+                                                    view().absolute()
+                                                        .top(px(8.0))
+                                                        .right(move || px(if notes_sidebar_open.get() { READER_PANEL_WIDTH + 16.0 } else { 16.0 }))
+                                                        .z_index(3)
+                                                        .child(button()
+                                                            .disabled(move || !enabled())
+                                                            .on_press(move || save())
+                                                            .child(text("Заметка")))
+                                                }))
                                         ).into_element();
                                 }
                             }
