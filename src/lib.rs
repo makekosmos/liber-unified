@@ -278,6 +278,15 @@ fn window_app(reader_window: bool) -> impl IntoElement {
         }
     }
     let reader_error = signal(startup_error);
+    let initial_notes_book = startup_selected
+        .and_then(|index| startup_books.get(index))
+        .map(|book| book.id.clone());
+    let initial_notes = initial_notes_book
+        .as_deref()
+        .map(|book_id| liber_core::notes::Notes::open(&liber_core::default_root(), book_id).items)
+        .unwrap_or_default();
+    let notes_snapshot_book = signal(initial_notes_book);
+    let notes_snapshot = signal(initial_notes);
     save_books(&startup_books);
     let books = signal(startup_books);
     let selected = signal(startup_selected);
@@ -320,7 +329,6 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let outline_sidebar_open = signal(true);
     let notes_sidebar_open = signal(false);
     let selection = signal(None::<SelectionDrag>);
-    let notes_revision = signal(0u64);
 
     let pending_pages = signal(Vec::<usize>::new());
     let reader_pages = reader_pages::ReaderPages {
@@ -378,6 +386,16 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let load_generation = signal(0u64);
     let preload_after_jump = request_page.clone();
     let load = std::rc::Rc::new(move |at: usize| {
+        if let Some(book_id) = selected
+            .get()
+            .and_then(|index| books.get().get(index).map(|book| book.id.clone()))
+            .filter(|book_id| !book_id.is_empty())
+        {
+            if notes_snapshot_book.get().as_deref() != Some(book_id.as_str()) {
+                notes_snapshot.set(liber_core::notes::Notes::open(&liber_core::default_root(), &book_id).items);
+                notes_snapshot_book.set(Some(book_id));
+            }
+        }
         let generation = load_generation.get().wrapping_add(1);
         load_generation.set(generation);
         page.set(at);
@@ -510,6 +528,11 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                         save_books(&list);
                         books.set(list);
                         open_reader_window(&book.path, &book.title);
+                        notes_snapshot.set(liber_core::notes::Notes::open(
+                            &liber_core::default_root(),
+                            &book.id,
+                        ).items);
+                        notes_snapshot_book.set(Some(book.id.clone()));
                         path.set(book.path);
                         count.set(rendered.count);
                         page.set(book.last_page);
@@ -876,9 +899,16 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                 )).text_size(px(11.0))),
                             );
                         }
-                                    let book_id = book.id.clone();
-                                    let _ = notes_revision.get();
-                                    let highlights = liber_core::notes::Notes::open(&liber_core::default_root(), &book_id).items;
+                                    if notes_snapshot_book.get().as_deref() != Some(book.id.as_str()) {
+                                        notes_snapshot.set(
+                                            liber_core::notes::Notes::open(
+                                                &liber_core::default_root(),
+                                                &book.id,
+                                            ).items,
+                                        );
+                                        notes_snapshot_book.set(Some(book.id.clone()));
+                                    }
+                                    let highlights = notes_snapshot.get();
                                     if reader_window {
                                         // The reader window's notes popover lists the highlights, like its contents.
                                         imago_window_macos::set_notes(
@@ -972,7 +1002,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
             let bar_title = book.title.clone();
             let bar_selection = selection;
             let bar_pages = rendered_pages;
-            let bar_notes_revision = notes_revision;
+            let bar_notes_snapshot = notes_snapshot;
+            let bar_notes_snapshot_book = notes_snapshot_book;
             let bar_books = books;
             let bar_path = path;
             let bar_zoom = zoom;
@@ -1113,7 +1144,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                 .find(|book| book.path == bar_path.get())
                                                                 .map(|book| book.id.clone()) else { return; };
                                                             let root = liber_core::default_root();
-                                                            let refresh = bar_notes_revision;
+                                                            let snapshot = bar_notes_snapshot;
+                                                            let snapshot_book = bar_notes_snapshot_book;
                                                             let selection = bar_selection;
                                                             spawn(async move {
                                                                 let Some(measurement) = drag.page_ref.measure().await else { return; };
@@ -1126,8 +1158,10 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                     local(drag.start_surface),
                                                                     local(drag.end_surface),
                                                                 ) else { return; };
-                                                                liber_core::notes::Notes::open(&root, &book_id).add(highlight);
-                                                                refresh.set(refresh.get().wrapping_add(1));
+                                                                let mut notes = liber_core::notes::Notes::open(&root, &book_id);
+                                                                notes.add(highlight);
+                                                                snapshot.set(notes.items);
+                                                                snapshot_book.set(Some(book_id));
                                                                 selection.set(None);
                                                             });
                                                         })
@@ -1210,12 +1244,10 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                         .flex_1()
                                                         .into_element()
                                                     } else {
-                                                        let notes_book_id = book_id.clone();
                                                         scroll().flex_1().horizontal().child(
                                                             view().w_full().min_w(px(680.0 * zoom.get())).flex_row().justify_center().child(
                                                         virtual_list(move || count.get(), move |position| {
                                                             let position = position;
-                                                            let page_book_id = notes_book_id.clone();
                                                             dynamic(move || {
                                                                 let index = position.index();
                                                                 let rendered = rendered_pages.get().get(index).and_then(|slot| slot.get());
@@ -1230,11 +1262,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                 let display_width = READING_WIDTH_PT * zoom.get();
                                                                 let scale = display_width / rendered.points.0;
                                                                 let image_height = display_width * height as f32 / width as f32;
-                                                                let _ = notes_revision.get();
-                                                                let saved_highlights = liber_core::notes::Notes::open(
-                                                                    &liber_core::default_root(),
-                                                                    &page_book_id,
-                                                                ).items;
+                                                                let saved_highlights = notes_snapshot.get();
                                                                 let mut highlight_overlay = view().absolute().inset_0()
                                                                     .pointer_events(PointerEvents::None);
                                                                 for highlight in saved_highlights.iter().filter(|highlight| highlight.page == index as u32) {
