@@ -11,6 +11,7 @@ pub mod page_view;
 
 use nsh_base::{button, safe_area_view};
 use nsh_core::color::rgb;
+use nsh_core::{TouchEvent, TouchPhase};
 use nsh_core::desktop::TitleBarStyle;
 use nsh_core::ui::desktop::{set_title_bar, title_bar};
 use nsh_core::ui::prelude::*;
@@ -204,6 +205,22 @@ fn reader_tone_color(tone: PageTone, dark: bool) -> u32 {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct SelectionDrag {
+    page: usize,
+    start_surface: (f32, f32),
+    end_surface: (f32, f32),
+    page_ref: ElementRef,
+}
+
+impl SelectionDrag {
+    fn is_drag(&self) -> bool {
+        let dx = self.end_surface.0 - self.start_surface.0;
+        let dy = self.end_surface.1 - self.start_surface.1;
+        dx * dx + dy * dy >= 9.0
+    }
+}
+
 fn window_app(reader_window: bool) -> impl IntoElement {
     let initial_tone = load_tone();
     let mut startup_books = load_books();
@@ -302,6 +319,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let library_sidebar_open = signal(false);
     let outline_sidebar_open = signal(true);
     let notes_sidebar_open = signal(false);
+    let selection = signal(None::<SelectionDrag>);
+    let notes_revision = signal(0u64);
 
     let pending_pages = signal(Vec::<usize>::new());
     let reader_pages = reader_pages::ReaderPages {
@@ -857,7 +876,9 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                 )).text_size(px(11.0))),
                             );
                         }
-                                    let highlights = liber_core::notes::Notes::open(&liber_core::default_root(), &book.id).items;
+                                    let book_id = book.id.clone();
+                                    let _ = notes_revision.get();
+                                    let highlights = liber_core::notes::Notes::open(&liber_core::default_root(), &book_id).items;
                                     if reader_window {
                                         // The reader window's notes popover lists the highlights, like its contents.
                                         imago_window_macos::set_notes(
@@ -949,6 +970,12 @@ fn window_app(reader_window: bool) -> impl IntoElement {
             let bar_previous = previous_page.clone();
             let bar_next = next_page.clone();
             let bar_title = book.title.clone();
+            let bar_selection = selection;
+            let bar_pages = rendered_pages;
+            let bar_notes_revision = notes_revision;
+            let bar_books = books;
+            let bar_path = path;
+            let bar_zoom = zoom;
             let bar_row = std::rc::Rc::new(move || {
                 let bar_previous = bar_previous.clone();
                 let bar_next = bar_next.clone();
@@ -1063,6 +1090,49 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                 .child(text("Копировать")),
                                                         ),
                                                 )
+                                                .child(
+                                                    button()
+                                                        .disabled(move || {
+                                                            text_mode.get()
+                                                                || !bar_selection.get().is_some_and(|drag| {
+                                                                    drag.is_drag()
+                                                                        && bar_pages.get().get(drag.page)
+                                                                            .and_then(|slot| slot.get())
+                                                                            .is_some_and(|page| !page.page_text.chars.is_empty())
+                                                                })
+                                                        })
+                                                        .on_press(move || {
+                                                            let Some(drag) = bar_selection.get() else { return; };
+                                                            if !drag.is_drag() { return; }
+                                                            let Some(rendered) = bar_pages.get().get(drag.page).and_then(|slot| slot.get()) else { return; };
+                                                            let page_text = rendered.page_text.clone();
+                                                            let points_width = rendered.points.0;
+                                                            let scale = READING_WIDTH_PT * bar_zoom.get() / points_width;
+                                                            if scale <= 0.0 { return; }
+                                                            let Some(book_id) = bar_books.get().iter()
+                                                                .find(|book| book.path == bar_path.get())
+                                                                .map(|book| book.id.clone()) else { return; };
+                                                            let root = liber_core::default_root();
+                                                            let refresh = bar_notes_revision;
+                                                            let selection = bar_selection;
+                                                            spawn(async move {
+                                                                let Some(measurement) = drag.page_ref.measure().await else { return; };
+                                                                let origin = (measurement.page.x.0, measurement.page.y.0);
+                                                                let local = |surface: (f32, f32)| {
+                                                                    ((surface.0 - origin.0) / scale, (surface.1 - origin.1) / scale)
+                                                                };
+                                                                let Some(highlight) = page_text.highlight(
+                                                                    drag.page as u32,
+                                                                    local(drag.start_surface),
+                                                                    local(drag.end_surface),
+                                                                ) else { return; };
+                                                                liber_core::notes::Notes::open(&root, &book_id).add(highlight);
+                                                                refresh.set(refresh.get().wrapping_add(1));
+                                                                selection.set(None);
+                                                            });
+                                                        })
+                                                        .child(text("Заметка")),
+                                                )
                                                 .child(button().on_press(move || {
                                                     animate_layout(nsh_core::LayoutAnimation::EASE_IN_EASE_OUT);
                                                     notes_sidebar_open.set(!notes_sidebar_open.get());
@@ -1140,10 +1210,12 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                         .flex_1()
                                                         .into_element()
                                                     } else {
+                                                        let notes_book_id = book_id.clone();
                                                         scroll().flex_1().horizontal().child(
                                                             view().w_full().min_w(px(680.0 * zoom.get())).flex_row().justify_center().child(
                                                         virtual_list(move || count.get(), move |position| {
                                                             let position = position;
+                                                            let page_book_id = notes_book_id.clone();
                                                             dynamic(move || {
                                                                 let index = position.index();
                                                                 let rendered = rendered_pages.get().get(index).and_then(|slot| slot.get());
@@ -1158,6 +1230,23 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                 let display_width = READING_WIDTH_PT * zoom.get();
                                                                 let scale = display_width / rendered.points.0;
                                                                 let image_height = display_width * height as f32 / width as f32;
+                                                                let _ = notes_revision.get();
+                                                                let saved_highlights = liber_core::notes::Notes::open(
+                                                                    &liber_core::default_root(),
+                                                                    &page_book_id,
+                                                                ).items;
+                                                                let mut highlight_overlay = view().absolute().inset_0()
+                                                                    .pointer_events(PointerEvents::None);
+                                                                for highlight in saved_highlights.iter().filter(|highlight| highlight.page == index as u32) {
+                                                                    for rect in &highlight.rects {
+                                                                        highlight_overlay = highlight_overlay.child(view().absolute()
+                                                                            .left(px(rect[0] * scale))
+                                                                            .top(px(rect[1] * scale))
+                                                                            .w(px((rect[2] - rect[0]) * scale))
+                                                                            .h(px((rect[3] - rect[1]) * scale))
+                                                                            .bg(rgb(highlight.tint.hex()).opacity(0.28)));
+                                                                    }
+                                                                }
                                                                 let mut selectable = view().absolute().inset_0();
                                                                 for run in rendered.text_runs {
                                                                     let font_size = (run.size as f32 * scale).clamp(6.0, 48.0);
@@ -1167,7 +1256,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                         .text_size(px(font_size)).text_color(rgb(LIBER_INK).opacity(0.0))
                                                                         .selectable(true).selection_color(rgb(LIBER_ACCENT)));
                                                                 }
-let body = view().relative().selection_area(true).w(px(display_width)).h(px(image_height));
+                                                                let page_ref = element_ref();
+                                                                let body = view().relative().selection_area(true).w(px(display_width)).h(px(image_height));
                                                                 #[cfg(target_os = "macos")]
                                                                 let body = {
                                                                     let tiles: Vec<JsonValue> = rendered
@@ -1206,7 +1296,35 @@ let body = view().relative().selection_area(true).w(px(display_width)).h(px(imag
                                                                     }
                                                                     body.child(image(rendered.png.clone()).w(px(display_width)).h(px(image_height))).child(tiles)
                                                                 };
-                                                                view().w_full().flex_row().justify_center().child(body.child(selectable)).into_element()
+                                                                let selection = selection;
+                                                                let body = body.child(highlight_overlay).child(selectable)
+                                                                    .element_ref(&page_ref)
+                                                                    .on_touch(move |event: &TouchEvent| {
+                                                                        if event.phase == TouchPhase::Cancel {
+                                                                            selection.set(None);
+                                                                            return;
+                                                                        }
+                                                                        let Some(point) = event.points.iter().find(|point| point.changed) else { return; };
+                                                                        let surface = (point.page.x.0, point.page.y.0);
+                                                                        match event.phase {
+                                                                            TouchPhase::Start => selection.set(Some(SelectionDrag {
+                                                                                page: index,
+                                                                                start_surface: surface,
+                                                                                end_surface: surface,
+                                                                                page_ref,
+                                                                            })),
+                                                                            TouchPhase::Move | TouchPhase::End => {
+                                                                                if let Some(mut drag) = selection.get() {
+                                                                                    if drag.page == index {
+                                                                                        drag.end_surface = surface;
+                                                                                        selection.set(Some(drag));
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            TouchPhase::Cancel => selection.set(None),
+                                                                        }
+                                                                    });
+                                                                view().w_full().flex_row().justify_center().child(body).into_element()
                                                             })
                                                         })
                                                         .estimated_item_size(move || px(980.0 * zoom.get()))

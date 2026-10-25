@@ -22,14 +22,14 @@ pub enum LinkTarget {
     Uri(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PageLink {
     /// `[x0, y0, x1, y1]` in page points.
     pub r: [f32; 4],
     pub target: LinkTarget,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PageText {
     pub chars: Vec<Ch>,
     pub links: Vec<PageLink>,
@@ -101,6 +101,30 @@ impl PageText {
             s.push(ch.c);
         }
         s.trim().to_owned()
+    }
+
+    pub fn highlight(&self, page: u32, start: (f32, f32), end: (f32, f32)) -> Option<Highlight> {
+        let a = self.hit(start.0, start.1)?;
+        let b = self.hit(end.0, end.1)?;
+        let text = self.text(a, b);
+        let rects = self.rects(a, b);
+        if text.is_empty() || rects.is_empty() {
+            return None;
+        }
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Some(Highlight {
+            id: format!("{page}-{created}"),
+            page,
+            rects,
+            text,
+            tint: Tint::Yellow,
+            note: String::new(),
+            created,
+            flow: Vec::new(),
+        })
     }
 }
 
@@ -264,6 +288,23 @@ mod tests {
         let p = page();
         assert_eq!(p.text(6, 13), "world sec");
         assert_eq!(p.text(0, 4), "hello");
+    }
+
+    #[test]
+    fn selection_becomes_persistent_highlight() {
+        let p = page();
+        let highlight = p.highlight(3, (15.0, 5.0), (45.0, 5.0)).unwrap();
+        assert_eq!(highlight.page, 3);
+        assert_eq!(highlight.text, "ello");
+        assert_eq!(highlight.rects, vec![[10.0, 0.0, 50.0, 10.0]]);
+
+        let dir = std::env::temp_dir().join(format!("liber-selection-note-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        Notes::open(&dir, "b1").add(highlight.clone());
+        let saved = Notes::open(&dir, "b1");
+        assert_eq!(saved.items, vec![highlight]);
+        assert_eq!(saved.items[0].text, "ello");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

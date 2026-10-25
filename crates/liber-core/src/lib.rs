@@ -103,6 +103,7 @@ pub struct Page {
     pub png: String,
     pub text: String,
     pub text_runs: Vec<TextRun>,
+    pub page_text: notes::PageText,
     pub toc: Vec<(String, usize, usize)>,
     pub size: (u32, u32),
     /// Original PDF page dimensions in points, used to position selectable text.
@@ -641,6 +642,7 @@ fn render_mupdf_page(
             png: preview.to_string_lossy().into_owned(),
             text: String::new(),
             text_runs: Vec::new(),
+            page_text: notes::PageText::default(),
             toc: toc.to_vec(),
             size,
             points: (point_width, point_height),
@@ -758,6 +760,8 @@ fn render_mupdf_page(
     let structured = text_page.structured();
     let mut text = String::new();
     let mut text_runs = Vec::new();
+    let mut page_text = notes::PageText::default();
+    let mut text_line = 0u32;
     for block in structured.blocks {
         if let TextBlockContent::Text { lines } = block.content {
             for line in lines {
@@ -781,6 +785,20 @@ fn render_mupdf_page(
                     y: f64::from(line.bounds.y1 - bounds.y0),
                     size: font_size,
                 });
+                page_text.chars.extend(line.chars.iter().map(|character| {
+                    let rect = mupdf::Rect::from(character.quad.clone());
+                    notes::Ch {
+                        c: character.ch,
+                        r: [
+                            rect.x0 - bounds.x0,
+                            rect.y0 - bounds.y0,
+                            rect.x1 - bounds.x0,
+                            rect.y1 - bounds.y0,
+                        ],
+                        line: text_line,
+                    }
+                }));
+                text_line = text_line.wrapping_add(1);
             }
         }
     }
@@ -789,6 +807,7 @@ fn render_mupdf_page(
         png: preview.to_string_lossy().into_owned(),
         text,
         text_runs,
+        page_text,
         toc: toc.to_vec(),
         size,
         points: (point_width, point_height),
