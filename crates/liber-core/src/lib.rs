@@ -3,6 +3,7 @@ use mupdf::{
     Colorspace, Document, Matrix, MetadataName, TextBlockContent, TextExtractOptions, TextPageFlags,
 };
 pub mod notes;
+mod syntax;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -115,6 +116,7 @@ pub struct Page {
     pub complete: bool,
 }
 
+// Flexoki reading colors adapted from https://stephango.com/flexoki (MIT).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PageTone {
     #[default]
@@ -136,10 +138,79 @@ impl PageTone {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Day => "День",
-            Self::Sepia => "Сепия",
-            Self::Gray => "Серая",
-            Self::Night => "Ночь",
+            Self::Day => "Светлая",
+            Self::Sepia => "Тёплая",
+            Self::Gray => "Тёмная",
+            Self::Night => "Чернильная",
+        }
+    }
+
+    pub fn palette(self) -> ReadingPalette {
+        match self {
+            Self::Day => ReadingPalette {
+                paper: 0xFFFCF0,
+                code_paper: 0xF2F0E5,
+                ink: 0x100F0F,
+                muted_ink: 0x6F6E69,
+                accent: 0x205EA6,
+                dark: false,
+            },
+            Self::Sepia => ReadingPalette {
+                paper: 0xF2F0E5,
+                code_paper: 0xE6E4D9,
+                ink: 0x282726,
+                muted_ink: 0x6F6E69,
+                accent: 0x205EA6,
+                dark: false,
+            },
+            Self::Gray => ReadingPalette {
+                paper: 0x1C1B1A,
+                code_paper: 0x100F0F,
+                ink: 0xCECDC3,
+                muted_ink: 0x878580,
+                accent: 0x4385BE,
+                dark: true,
+            },
+            Self::Night => ReadingPalette {
+                paper: 0x100F0F,
+                code_paper: 0x1C1B1A,
+                ink: 0xCECDC3,
+                muted_ink: 0x878580,
+                accent: 0x4385BE,
+                dark: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadingPalette {
+    pub paper: u32,
+    pub code_paper: u32,
+    pub ink: u32,
+    pub muted_ink: u32,
+    pub accent: u32,
+    pub dark: bool,
+}
+
+impl ReadingPalette {
+    pub fn code_ink(self, token: CodeToken) -> u32 {
+        use CodeToken::*;
+        match (token, self.dark) {
+            (Comment, false) => 0x6F6E69,
+            (Comment, true) => 0x878580,
+            (String, false) => 0x66800B,
+            (String, true) => 0x879A39,
+            (Number, false) => 0xBC5215,
+            (Number, true) => 0xDA702C,
+            (Keyword, false) => 0x5E409D,
+            (Keyword, true) => 0x8B7EC8,
+            (Type, false) => 0xAD8301,
+            (Type, true) => 0xD0A215,
+            (Function, false) => 0x205EA6,
+            (Function, true) => 0x4385BE,
+            (Operator, false) => 0x24837B,
+            (Operator, true) => 0x3AA99F,
         }
     }
 }
@@ -167,6 +238,32 @@ pub struct TextRun {
 pub struct SearchHit {
     pub page: usize,
     pub excerpt: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReadingBlock {
+    pub text: String,
+    pub code: bool,
+    #[serde(default)]
+    pub syntax: Vec<CodeSpan>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodeToken {
+    Comment,
+    String,
+    Number,
+    Keyword,
+    Type,
+    Function,
+    Operator,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeSpan {
+    pub start: usize,
+    pub end: usize,
+    pub token: CodeToken,
 }
 
 pub fn default_root() -> PathBuf {
@@ -431,7 +528,9 @@ fn page_files_exist(page: &Page) -> bool {
 }
 
 fn keep_recent_page_files(page: &Page) {
-    let files: Vec<PathBuf> = page.tiles.iter()
+    let files: Vec<PathBuf> = page
+        .tiles
+        .iter()
         .map(|tile| &tile.png)
         .map(PathBuf::from)
         .collect();
@@ -829,16 +928,16 @@ fn apply_tone(pixmap: &mut mupdf::Pixmap, tone: PageTone) {
     if components < 3 || stride == 0 {
         return;
     }
+    let palette = tone.palette();
     for row in pixmap.samples_mut().chunks_mut(stride).take(height) {
         for pixel in row.chunks_mut(components).take(width) {
             let (r, g, b) = (pixel[0], pixel[1], pixel[2]);
             let light = ((u16::from(r) * 77 + u16::from(g) * 150 + u16::from(b) * 29) / 256) as u8;
-            let (r, g, b) = match tone {
-                PageTone::Day => (r, g, b),
-                PageTone::Sepia => paper_tone(light, SEPIA_INK, SEPIA_PAPER),
-                PageTone::Gray => (lift(255 - r), lift(255 - g), lift(255 - b)),
-                PageTone::Night => paper_tone(light, NIGHT_INK, NIGHT_PAPER),
-            };
+            let (r, g, b) = paper_tone(
+                light,
+                rgb_channels(palette.ink),
+                rgb_channels(palette.paper),
+            );
             pixel[0] = r;
             pixel[1] = g;
             pixel[2] = b;
@@ -846,10 +945,13 @@ fn apply_tone(pixmap: &mut mupdf::Pixmap, tone: PageTone) {
     }
 }
 
-const SEPIA_INK: [u8; 3] = [0x3B, 0x2F, 0x24];
-const SEPIA_PAPER: [u8; 3] = [0xF4, 0xEC, 0xD8];
-const NIGHT_INK: [u8; 3] = [0xB4, 0xB4, 0xB8];
-const NIGHT_PAPER: [u8; 3] = [0x17, 0x17, 0x1A];
+fn rgb_channels(color: u32) -> [u8; 3] {
+    [
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+    ]
+}
 
 /// Maps a pixel to ink on paper by its brightness: white stays paper, black becomes ink.
 fn paper_tone(light: u8, ink: [u8; 3], paper: [u8; 3]) -> (u8, u8, u8) {
@@ -861,10 +963,6 @@ fn paper_tone(light: u8, ink: [u8; 3], paper: [u8; 3]) -> (u8, u8, u8) {
         mix(ink[1], paper[1]),
         mix(ink[2], paper[2]),
     )
-}
-
-fn lift(value: u8) -> u8 {
-    (0x3A + (u16::from(value) * (0xE5 - 0x3A)) / 255) as u8
 }
 
 /// Search each page's text layer and return one short excerpt per matching page.
@@ -946,6 +1044,652 @@ pub fn extract_page_text(path: impl AsRef<Path>, index: usize) -> Result<String,
     Ok(text)
 }
 
+pub fn extract_reading_blocks(
+    path: impl AsRef<Path>,
+    index: usize,
+) -> Result<Vec<ReadingBlock>, String> {
+    let path = path.as_ref();
+    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let cache_dir = text_cache_dir(path, &metadata);
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let cached = cache_dir.join(format!("{index}.reading-v34.json"));
+    if let Ok(bytes) = std::fs::read(&cached)
+        && let Ok(blocks) = serde_json::from_slice(&bytes)
+    {
+        return Ok(blocks);
+    }
+    let path = path.to_string_lossy();
+    let document =
+        Document::open(path.as_ref()).map_err(|e| format!("Не удалось открыть PDF: {e}"))?;
+    if index >= document.page_count().unwrap_or(0).max(0) as usize || index > i32::MAX as usize {
+        return Err("Страница не найдена".into());
+    }
+    let page = document
+        .load_page(index as i32)
+        .map_err(|e| format!("Не удалось прочитать страницу PDF: {e}"))?;
+    let page_bounds = page.bounds().map_err(|e| e.to_string())?;
+    let text_page = page
+        .to_text_page(TextPageFlags::PRESERVE_LIGATURES | TextPageFlags::PRESERVE_WHITESPACE)
+        .map_err(|e| e.to_string())?;
+    let mut blocks = Vec::new();
+    for block in text_page.blocks() {
+        let mut lines = Vec::new();
+        let mut char_count = 0usize;
+        let mut size_sum = 0.0f32;
+        let mut indent_columns = Vec::new();
+        let mut line_bounds = Vec::new();
+        let bounds = block.bounds();
+        for line in block.lines() {
+            let mut value = String::new();
+            for character in line.chars() {
+                let Some(ch) = character.char() else { continue };
+                value.push(ch);
+                if !ch.is_whitespace() {
+                    char_count += 1;
+                    size_sum += character.size();
+                }
+            }
+            let line_bounds_value = line.bounds();
+            line_bounds.push((
+                line_bounds_value.y0 - page_bounds.y0,
+                line_bounds_value.y1 - page_bounds.y0,
+            ));
+            indent_columns.push(line_bounds_value.x0);
+            lines.push(value);
+        }
+        if lines.is_empty() || char_count == 0 {
+            continue;
+        }
+        let average_size = size_sum / char_count as f32;
+        let column_width = (average_size * 0.6).max(1.0);
+        for x in &mut indent_columns {
+            *x = ((*x - bounds.x0).max(0.0) / column_width).round();
+        }
+        let repaired_lines: Vec<_> = lines
+            .iter()
+            .map(|line| repair_code_letter_runs(line))
+            .collect();
+        let nonempty: Vec<_> = repaired_lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect();
+        let syntax_line = |line: &&str| {
+            is_code_line(line) || line.ends_with('}') || line.contains(" = ") || line.contains("=>")
+        };
+        let syntax_count = nonempty.iter().filter(|line| syntax_line(line)).count();
+        let code = nonempty.len() >= 2 && syntax_count * 2 >= nonempty.len();
+        let mut positioned_code_rows = Vec::new();
+        let text = if code {
+            let mut fragments: Vec<_> = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(i, line)| {
+                    (!line.trim().is_empty()).then_some((
+                        line_bounds[i].0,
+                        line_bounds[i].1,
+                        indent_columns[i] as usize,
+                        line.as_str(),
+                    ))
+                })
+                .collect();
+            fragments.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)));
+            let mut rows: Vec<(f32, f32, Vec<(usize, &str)>)> = Vec::new();
+            for (y0, y1, column, line) in fragments {
+                if let Some((_row_start, row_end, row)) = rows
+                    .last_mut()
+                    .filter(|(row_start, _, _)| (*row_start - y0).abs() < average_size * 0.3)
+                {
+                    row.push((column, line));
+                    *row_end = row_end.max(y1);
+                } else {
+                    rows.push((y0, y1, vec![(column, line)]));
+                }
+            }
+            let rows: Vec<_> = rows
+                .into_iter()
+                .map(|(y0, y1, mut fragments)| {
+                    fragments.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut row = String::new();
+                    for (column, line) in fragments {
+                        let gap = column.saturating_sub(row.chars().count());
+                        row.push_str(&" ".repeat(gap.min(80)));
+                        row.push_str(line.trim());
+                    }
+                    (y0, y1, row)
+                })
+                .collect::<Vec<_>>();
+            positioned_code_rows = rows.clone();
+            rows.into_iter()
+                .map(|(_, _, line)| repair_code_letter_runs(&line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            let mut joined = String::new();
+            for line in &lines {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if joined.is_empty() {
+                    joined.push_str(line);
+                    continue;
+                }
+                let hyphen = joined.ends_with(['-', '\u{ad}'])
+                    && joined.chars().rev().nth(1).is_some_and(char::is_alphabetic)
+                    && line.chars().next().is_some_and(char::is_lowercase);
+                if hyphen {
+                    joined.pop();
+                } else {
+                    joined.push(' ');
+                }
+                joined.push_str(line);
+            }
+            repair_ascii_letter_runs(&joined)
+        };
+        let in_margin = bounds.y1 < page_bounds.y0 + page_bounds.height() * 0.07
+            || bounds.y0 > page_bounds.y0 + page_bounds.height() * 0.93;
+        if in_margin && text.chars().count() < 80 {
+            continue;
+        }
+        if !text.trim().is_empty() {
+            if code {
+                for (row_y0, row_y1, line) in positioned_code_rows {
+                    blocks.push((
+                        ReadingBlock {
+                            text: line,
+                            code: true,
+                            syntax: Vec::new(),
+                        },
+                        row_y0,
+                        row_y1,
+                        average_size,
+                        bounds.x0,
+                    ));
+                }
+            } else {
+                for (i, line) in lines.iter().enumerate() {
+                    let line = repair_code_letter_runs(line.trim());
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let (line_y0, line_y1) = line_bounds[i];
+                    let line_x0 = bounds.x0 + indent_columns[i] * column_width;
+                    if let Some(at) = code_start(&line) {
+                        let prose = line[..at].trim();
+                        if !prose.is_empty() {
+                            blocks.push((
+                                ReadingBlock {
+                                    text: prose.to_owned(),
+                                    code: false,
+                                    syntax: Vec::new(),
+                                },
+                                line_y0,
+                                line_y1,
+                                average_size,
+                                line_x0,
+                            ));
+                        }
+                        blocks.push((
+                            ReadingBlock {
+                                text: line[at..].to_owned(),
+                                code: true,
+                                syntax: Vec::new(),
+                            },
+                            line_y0,
+                            line_y1,
+                            average_size,
+                            line_x0,
+                        ));
+                    } else if is_code_line(&line) {
+                        blocks.push((
+                            ReadingBlock {
+                                text: line,
+                                code: true,
+                                syntax: Vec::new(),
+                            },
+                            line_y0,
+                            line_y1,
+                            average_size,
+                            line_x0,
+                        ));
+                    } else {
+                        blocks.push((
+                            ReadingBlock {
+                                text: line,
+                                code: false,
+                                syntax: Vec::new(),
+                            },
+                            line_y0,
+                            line_y1,
+                            average_size,
+                            line_x0,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    blocks.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.4.total_cmp(&b.4)));
+    let mut aligned_rows = Vec::with_capacity(blocks.len());
+    let mut at = 0;
+    while at < blocks.len() {
+        let row_y0 = blocks[at].1;
+        let row_size = blocks[at].3;
+        let mut end = at + 1;
+        while end < blocks.len()
+            && (blocks[end].1 - row_y0).abs() < row_size.max(blocks[end].3) * 0.3
+        {
+            end += 1;
+        }
+        let has_code = blocks[at..end].iter().any(|(block, ..)| block.code);
+        let mergeable = has_code
+            && blocks[at..end]
+                .iter()
+                .all(|(block, ..)| block.code || block.text.lines().count() == 1);
+        if mergeable {
+            let mut row = blocks[at..end].iter().collect::<Vec<_>>();
+            row.sort_by(|a, b| a.4.total_cmp(&b.4));
+            let base_x0 = row
+                .iter()
+                .find(|(block, ..)| block.code)
+                .map_or(row[0].4, |item| item.4);
+            let size = row.iter().map(|item| item.3).fold(0.0f32, f32::max);
+            let column_width = (size * 0.6).max(1.0);
+            let mut text = String::new();
+            let mut has_comment = false;
+            for &(block, _, _, _, x0) in &row {
+                if !text.is_empty() {
+                    let target_column = ((*x0 - base_x0).max(0.0) / column_width).round() as usize;
+                    let width = text.chars().count();
+                    let min_gap = if block.text.trim_start().starts_with("//") {
+                        2
+                    } else {
+                        1
+                    };
+                    let gap = target_column.saturating_sub(width).max(min_gap).min(80);
+                    if block.code || block.text.trim_start().starts_with("//") {
+                        text.push_str(&" ".repeat(gap));
+                        text.push_str(&block.text);
+                    } else {
+                        if !has_comment {
+                            let text_end = text.trim_end().len();
+                            if text[..text_end].ends_with("//") {
+                                text.truncate(text_end - 2);
+                                text.push_str(" // ");
+                            } else {
+                                text.push_str(" // ");
+                            }
+                            has_comment = true;
+                        } else {
+                            text.push(' ');
+                        }
+                        text.push_str(block.text.trim());
+                    }
+                } else {
+                    text.push_str(&block.text);
+                }
+            }
+            let y1 = row.iter().map(|item| item.2).fold(row[0].2, f32::max);
+            let text = text.replace("// //", "//").replace("////", "//");
+            aligned_rows.push((
+                ReadingBlock {
+                    text,
+                    code: true,
+                    syntax: Vec::new(),
+                },
+                row_y0,
+                y1,
+                size,
+                base_x0,
+            ));
+        } else {
+            aligned_rows.extend(blocks[at..end].iter().cloned());
+        }
+        at = end;
+    }
+    let mut blocks: Vec<(ReadingBlock, f32, f32, f32, f32)> =
+        Vec::with_capacity(aligned_rows.len());
+    for (block, y0, y1, size, x0) in aligned_rows {
+        if !block.code {
+            if let Some((previous, previous_y0, previous_y1, previous_size, previous_x0)) =
+                blocks.last_mut()
+            {
+                let vertical_gap = y0 - *previous_y1;
+                let same_column = (x0 - *previous_x0).abs() <= size.max(*previous_size) * 0.6;
+                if !previous.code
+                    && same_column
+                    && (0.0..=size.max(*previous_size) * 1.8).contains(&vertical_gap)
+                {
+                    previous.text = join_reading_prose(&[previous.text.clone(), block.text]);
+                    *previous_y1 = y1.max(*previous_y1);
+                    *previous_size = size.max(*previous_size);
+                    *previous_y0 = previous_y0.min(y0);
+                    continue;
+                }
+            }
+        }
+        blocks.push((block, y0, y1, size, x0));
+    }
+    let mut merged: Vec<(ReadingBlock, f32, f32, f32, f32)> = Vec::with_capacity(blocks.len());
+    for (block, y0, y1, size, x0) in blocks {
+        if block.code {
+            if let Some((previous, previous_y0, previous_y1, previous_size, base_x0)) =
+                merged.last_mut()
+            {
+                let same_row = (y0 - *previous_y0).abs() <= size.max(*previous_size) * 0.35;
+                let vertical_gap = y0 - *previous_y1;
+                if previous.code
+                    && (same_row
+                        || (-*previous_size * 0.5..=size.max(*previous_size) * 1.8)
+                            .contains(&vertical_gap))
+                {
+                    if same_row {
+                        let existing_width = previous
+                            .text
+                            .rsplit('\n')
+                            .next()
+                            .unwrap_or_default()
+                            .chars()
+                            .count();
+                        let target_column =
+                            ((x0 - *base_x0).max(0.0) / (size * 0.6).max(1.0)).round() as usize;
+                        previous.text.push_str(
+                            &" ".repeat(
+                                target_column.saturating_sub(existing_width).max(1).min(80),
+                            ),
+                        );
+                    } else {
+                        previous.text.push('\n');
+                        let indent =
+                            ((x0 - *base_x0).max(0.0) / (size * 0.6).max(1.0)).round() as usize;
+                        previous.text.push_str(&" ".repeat(indent.min(80)));
+                        *previous_y0 = y0;
+                    }
+                    previous.text.push_str(&block.text);
+                    *previous_y1 = previous_y1.max(y1);
+                    *previous_size = previous_size.max(size);
+                    continue;
+                }
+            }
+        }
+        merged.push((block, y0, y1, size, x0));
+    }
+    let blocks: Vec<_> = merged
+        .into_iter()
+        .map(|(mut block, _, _, _, _)| {
+            if block.code {
+                block.text = block
+                    .text
+                    .lines()
+                    .map(repair_code_letter_runs)
+                    .filter_map(|line| {
+                        let trimmed = line.trim_end();
+                        if trimmed == "//" {
+                            None
+                        } else if let Some(code) = trimmed.strip_suffix("//") {
+                            (!code.trim().is_empty()).then(|| code.trim_end().to_owned())
+                        } else {
+                            Some(if let Some((code, comment)) = line.split_once("//") {
+                                if code.trim().is_empty() {
+                                    line
+                                } else {
+                                    format!("{} // {}", code.trim_end(), comment.trim_start())
+                                }
+                            } else {
+                                line
+                            })
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                block.text = block.text.replace("// //", "//").replace("////", "//");
+                block.syntax = syntax::lex(&block.text);
+            }
+            block
+        })
+        .collect();
+    if let Ok(bytes) = serde_json::to_vec(&blocks) {
+        let _ = std::fs::write(cached, bytes);
+    }
+    Ok(blocks)
+}
+
+/// MuPDF can expose a PDF word as a run of individually spaced glyphs.
+/// Rejoin ASCII identifier fragments in the same way as the established GPUI reader.
+fn repair_ascii_letter_runs(text: &str) -> String {
+    let tokens: Vec<_> = text.split_whitespace().collect();
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let mut end = i;
+        while let Some(token) = tokens.get(end) {
+            if token.len() != 1 || !token.as_bytes()[0].is_ascii_alphabetic() {
+                break;
+            }
+            end += 1;
+        }
+        if end - i >= 3 {
+            out.push(tokens[i..end].concat());
+            i = end;
+        } else {
+            out.push(tokens[i].to_owned());
+            i += 1;
+        }
+    }
+    out.join(" ")
+}
+
+fn code_start(line: &str) -> Option<usize> {
+    let starts = [
+        "class ",
+        "constructor(",
+        "function ",
+        "return ",
+        "const ",
+        "let ",
+        "var ",
+        "this.",
+    ];
+    starts
+        .iter()
+        .filter_map(|needle| line.find(needle))
+        .filter(|at| {
+            let prefix = line[..*at].trim_end();
+            prefix.is_empty() || prefix.ends_with(':')
+        })
+        .min()
+}
+
+fn is_code_line(line: &str) -> bool {
+    let line = line.trim();
+    [
+        "class ",
+        "constructor(",
+        "function ",
+        "return ",
+        "const ",
+        "let ",
+        "var ",
+        "this.",
+        "distance",
+        "//",
+        "}",
+        "{",
+        "for(",
+        "for (",
+        "if(",
+        "if (",
+        "else ",
+        "while(",
+        "while (",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+        || line.ends_with([';', '{', '}'])
+        || [
+            "++", "--", "+=", "-=", "*=", "/=", "%=", "===", "!==", ">=", "<=", "&&", "||",
+        ]
+        .iter()
+        .any(|operator| line.contains(operator))
+}
+
+fn join_reading_prose(lines: &[String]) -> String {
+    let mut joined = String::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if joined.is_empty() {
+            joined.push_str(line);
+            continue;
+        }
+        let hyphen = joined.ends_with(['-', '\u{ad}'])
+            && joined.chars().rev().nth(1).is_some_and(char::is_alphabetic)
+            && line.chars().next().is_some_and(char::is_lowercase);
+        if hyphen {
+            joined.pop();
+        } else {
+            joined.push(' ');
+        }
+        joined.push_str(line);
+    }
+    repair_ascii_letter_runs(&joined)
+}
+
+fn repair_code_letter_runs(text: &str) -> String {
+    const WORDS: &[&str] = &[
+        "abstract",
+        "arguments",
+        "array",
+        "async",
+        "await",
+        "boolean",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "constructor",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "distance",
+        "do",
+        "else",
+        "enum",
+        "eval",
+        "export",
+        "extends",
+        "false",
+        "factorial",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "instanceof",
+        "interface",
+        "let",
+        "Math",
+        "new",
+        "null",
+        "of",
+        "package",
+        " Point",
+        "private",
+        "product",
+        "protected",
+        "public",
+        "return",
+        "static",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "undefined",
+        "abs",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+        "sqrt",
+        "sum",
+        "Point",
+    ];
+    let tokens: Vec<_> = text
+        .split_whitespace()
+        .map(|token| {
+            let start = token.as_ptr() as usize - text.as_ptr() as usize;
+            (start, start + token.len())
+        })
+        .collect();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut i = 0;
+    while i < tokens.len() {
+        let (token_start, token_end) = tokens[i];
+        out.push_str(&text[cursor..token_start]);
+        let mut merged = String::new();
+        let mut found = None;
+        for end in i..tokens.len().min(i + 12) {
+            let (start, finish) = tokens[end];
+            if end > i && text[tokens[end - 1].1..start].chars().count() > 1 {
+                break;
+            }
+            let token = &text[start..finish];
+            let Some(start) = token.find(|c: char| c.is_ascii_alphabetic()) else {
+                break;
+            };
+            let finish = token[start..]
+                .find(|c: char| !c.is_ascii_alphabetic())
+                .map_or(token.len(), |offset| start + offset);
+            let prefix = &token[..start];
+            let part = &token[start..finish];
+            if !part.chars().all(|c| c.is_ascii_alphabetic()) || (end > i && !prefix.is_empty()) {
+                break;
+            }
+            merged.push_str(part);
+            if end > i && WORDS.iter().any(|word| word.eq_ignore_ascii_case(&merged)) {
+                let leading = text[token_start..token_end]
+                    .find(|c: char| c.is_ascii_alphabetic())
+                    .unwrap();
+                found = Some((
+                    end + 1,
+                    tokens[end].1,
+                    format!(
+                        "{}{}{}",
+                        &text[token_start..token_start + leading],
+                        merged,
+                        &token[finish..]
+                    ),
+                ));
+            }
+        }
+        if let Some((next, end, word)) = found {
+            out.push_str(&word);
+            cursor = end;
+            i = next;
+        } else {
+            out.push_str(&text[token_start..token_end]);
+            cursor = token_end;
+            i += 1;
+        }
+    }
+    out.push_str(&text[cursor..]);
+    out.replace("/ /", "//")
+        .replace("this,", "this.")
+        .replace(" (", "(")
+}
+
 fn find_excerpt(text: &str, needle: &[char]) -> Option<String> {
     if needle.is_empty() {
         return None;
@@ -965,7 +1709,84 @@ fn find_excerpt(text: &str, needle: &[char]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Book, PageTone, find_excerpt, render_cancellable, render_with_tone, search_books};
+    use super::{
+        Book, PageTone, extract_reading_blocks, find_excerpt, render_cancellable, render_with_tone,
+        search_books,
+    };
+
+    /// Regression for a mixed code and explanation page in the Russian JavaScript book.
+    /// Run with `LIBER_READER_LAYOUT_PDF=/path/book.pdf cargo test -p liber-core reader_keeps_explanations_out_of_code -- --ignored`.
+    #[test]
+    #[ignore = "requires the JavaScript reader-layout PDF"]
+    fn reader_aligns_explanations_with_their_code_rows() {
+        let path = std::env::var("LIBER_READER_LAYOUT_PDF").expect("set LIBER_READER_LAYOUT_PDF");
+        let blocks = extract_reading_blocks(path, 31).expect("extract page 32");
+        assert!(blocks.iter().any(|block| {
+            block.code
+                && block
+                    .text
+                    .lines()
+                    .any(|line| line.contains("let") && line.contains("Начать с произведения 1"))
+        }));
+        assert!(blocks.iter().any(|block| {
+            block.code
+                && block.text.lines().any(|line| {
+                    line.contains("let") && line.contains("; // Начать с произведения 1")
+                })
+        }));
+        assert!(blocks.iter().any(|block| {
+            block.code
+                && block
+                    .text
+                    .lines()
+                    .any(|line| line.contains("while") && line.contains("Повторять операторы"))
+        }));
+        assert!(blocks.iter().any(|block| {
+            block.code
+                && block
+                    .text
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("// пока выражение"))
+        }));
+        assert!(
+            blocks.iter().any(|block| block.code
+                && block
+                    .text
+                    .lines()
+                    .any(|line| line.contains("for(let x of array)")
+                        && line.contains("в цикле по массиву")))
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.code && block.text.contains("product *= n;"))
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.code && block.text.contains("product *= i"))
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.code && block.text.contains("factorial(5)"))
+        );
+        let code = blocks
+            .iter()
+            .filter(|block| block.code)
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.lines().any(|line| line.trim() == "//"));
+        assert!(
+            !code
+                .lines()
+                .any(|line| line.trim_start().starts_with("// }"))
+        );
+        assert!(code.contains("abs("));
+        assert!(!code.contains("a b s"));
+    }
+
     #[test]
     fn progress_is_clamped_and_handles_single_page_documents() {
         let mut book = Book {

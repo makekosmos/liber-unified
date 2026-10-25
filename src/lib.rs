@@ -1,23 +1,22 @@
 //! Liber desktop app. The native UI and PDF reader share one application root.
 use liber_core::{
-    PageTone, READING_WIDTH_PT, extract_page_text, import_pdf_with_first_page, load_books, render,
+    PageTone, READING_WIDTH_PT, extract_reading_blocks, import_pdf_with_first_page, load_books,
     render_with_tone, save_books, search_books, search_pdf, set_progress,
 };
+#[cfg(target_os = "macos")]
+pub mod page_view;
 pub mod reader_pages;
 pub mod reader_window;
 pub mod sidebar;
-#[cfg(target_os = "macos")]
-pub mod page_view;
 
 use nsh_base::{button, safe_area_view};
 use nsh_core::color::rgb;
-use nsh_core::{TouchEvent, TouchPhase};
 use nsh_core::desktop::TitleBarStyle;
 use nsh_core::ui::desktop::{set_title_bar, title_bar};
 use nsh_core::ui::prelude::*;
+use serde_json::{Value as JsonValue, json};
 use sidebar::{Page, native_sidebar};
 use std::path::PathBuf;
-use serde_json::{json, Value as JsonValue};
 use std::sync::Mutex;
 
 const LIBER_BG: u32 = 0xF5F5F7;
@@ -29,8 +28,6 @@ const LIBER_SURFACE_DARK: u32 = 0x202024;
 const LIBER_TEXT_DARK: u32 = 0xF2F2F7;
 const LIBER_MUTED_LIGHT: u32 = 0x77777D;
 const LIBER_MUTED_DARK: u32 = 0xA0A0A8;
-const LIBER_READER_LIGHT: u32 = 0xE9E9EB;
-const LIBER_READER_DARK: u32 = 0x29292D;
 const LIBER_PANEL_LIGHT: u32 = 0xF0F0F2;
 const LIBER_COVER_LIGHT: u32 = 0xD9D9DE;
 const LIBER_COVER_DARK: u32 = 0x3A3A40;
@@ -55,6 +52,7 @@ const READER_TONES: [PageTone; 4] = [
     PageTone::Gray,
     PageTone::Night,
 ];
+
 const BOOK_CARD_WIDTH: f32 = 176.0;
 const BOOK_CARD_HEIGHT: f32 = 226.0;
 const SPACE_16: f32 = 16.0;
@@ -190,19 +188,8 @@ pub fn open_startup_reader() {
     }
 }
 
-fn reader_tone_color(tone: PageTone, dark: bool) -> u32 {
-    match tone {
-        PageTone::Day => {
-            if dark {
-                LIBER_READER_DARK
-            } else {
-                LIBER_READER_LIGHT
-            }
-        }
-        PageTone::Sepia => 0xF4ECD8,
-        PageTone::Gray => 0x29292D,
-        PageTone::Night => 0x17171A,
-    }
+fn reader_tone_color(tone: PageTone) -> u32 {
+    tone.palette().paper
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -210,7 +197,6 @@ struct SelectionDrag {
     page: usize,
     start_surface: (f32, f32),
     end_surface: (f32, f32),
-    page_ref: ElementRef,
 }
 
 impl SelectionDrag {
@@ -247,33 +233,33 @@ fn window_app(reader_window: bool) -> impl IntoElement {
         match import_pdf_with_first_page(&source) {
             Err(error) => startup_error = Some(format!("Не удалось открыть книгу: {error}")),
             Ok((book, first_page)) => {
-            let source = book.path.clone();
-            let at = startup_books
-                .iter()
-                .position(|candidate| candidate.path == source)
-                .unwrap_or_else(|| {
-                    startup_books.push(book.clone());
-                    startup_books.len() - 1
-                });
-            startup_path = source.clone();
-            startup_selected = Some(at);
-            startup_count = book.pages;
-            startup_page = startup_books[at]
-                .last_page
-                .min(book.pages.saturating_sub(1));
-            let loaded = if startup_page == 0 && initial_tone == PageTone::Day {
-                first_page.or_else(|| render(&source, 0, false).ok())
-            } else {
-                render_with_tone(&source, startup_page, 1.0, initial_tone).ok()
-            };
-            if let Some(data) = loaded {
-                startup_rendered = Some((startup_page, data.clone()));
-                startup_image = data.png;
-                startup_text = data.text;
-                startup_runs = data.text_runs;
-                startup_outline = data.toc;
-                startup_size = data.size;
-            }
+                let source = book.path.clone();
+                let at = startup_books
+                    .iter()
+                    .position(|candidate| candidate.path == source)
+                    .unwrap_or_else(|| {
+                        startup_books.push(book.clone());
+                        startup_books.len() - 1
+                    });
+                startup_path = source.clone();
+                startup_selected = Some(at);
+                startup_count = book.pages;
+                startup_page = startup_books[at]
+                    .last_page
+                    .min(book.pages.saturating_sub(1));
+                let loaded = if startup_page == 0 && initial_tone == PageTone::Day {
+                    first_page.or_else(|| render_with_tone(&source, 0, 1.0, initial_tone).ok())
+                } else {
+                    render_with_tone(&source, startup_page, 1.0, initial_tone).ok()
+                };
+                if let Some(data) = loaded {
+                    startup_rendered = Some((startup_page, data.clone()));
+                    startup_image = data.png;
+                    startup_text = data.text;
+                    startup_runs = data.text_runs;
+                    startup_outline = data.toc;
+                    startup_size = data.size;
+                }
             }
         }
     }
@@ -293,8 +279,40 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let section = signal(Page::Home);
     let path = signal(startup_path);
     let page = signal(startup_page);
-    let initial_page = startup_page;
+    // The virtual list reads this only when its mode is created. The live page
+    // signal changes while scrolling and must not rebuild the list on every
+    // page boundary.
+    let scroll_restore_page = signal(startup_page);
+    // Ignore pre-restoration visibility from a newly created list so row 0
+    // cannot overwrite the saved progress before initial_scroll_index applies.
+    let restore_page_pending = signal(true);
     let count = signal(startup_count);
+    let record_page = std::rc::Rc::new(move |at: usize| {
+        if count.get() == 0 {
+            return;
+        }
+        let at = at.min(count.get() - 1);
+        if page.get() != at {
+            page.set(at);
+        }
+        let Some(index) = selected.get() else {
+            return;
+        };
+        let mut list = books.get();
+        let Some(book) = list.get(index) else {
+            return;
+        };
+        if book.last_page == at {
+            return;
+        }
+        let id = book.id.clone();
+        if id.is_empty() {
+            list[index].last_page = at;
+        } else {
+            set_progress(&mut list, &id, at);
+        }
+        save_books(&list);
+    });
     let image_path = signal(startup_image);
     let extracted = signal(startup_text.clone());
     let outline = signal(startup_outline);
@@ -308,11 +326,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     }
     let rendered_pages: Signal<Vec<Signal<Option<liber_core::Page>>>> =
         signal(initial_pages.into_iter().map(signal).collect());
-    let mut initial_reading_pages = vec![None; startup_count];
-    if let Some(slot) = initial_reading_pages.get_mut(startup_page) {
-        *slot = Some(startup_text.clone());
-    }
-    let reading_pages = signal(initial_reading_pages);
+    let reading_pages = signal(vec![None::<Vec<liber_core::ReadingBlock>>; startup_count]);
     let pending_text_pages = signal(Vec::<usize>::new());
     let error = signal(String::new());
     let query = signal(String::new());
@@ -321,6 +335,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let search_generation = signal(0u64);
     let text_mode = signal(false);
     let zoom = signal(1.0f32);
+    let gesture_zoom = animated_value(1.0f32);
+    let reader_viewport_width = signal(1000.0f32);
     // Shown while the pointer is on the reader window's top edge.
     let tone = signal(initial_tone);
     let dark = signal(load_dark());
@@ -330,6 +346,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let outline_sidebar_open = signal(true);
     let notes_sidebar_open = signal(false);
     let selection = signal(None::<SelectionDrag>);
+    let note_comment = signal(String::new());
+    let note_draft = signal(None::<liber_core::notes::Highlight>);
     let note_action_enabled = std::rc::Rc::new(move || {
         !text_mode.get()
             && selection.get().is_some_and(|drag| {
@@ -341,34 +359,76 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                         .is_some_and(|page| !page.page_text.chars.is_empty())
             })
     });
-    let save_selection_note = std::rc::Rc::new(move || {
-        let Some(drag) = selection.get() else { return; };
-        if !drag.is_drag() { return; }
-        let Some(rendered) = rendered_pages.get().get(drag.page).and_then(|slot| slot.get()) else { return; };
+    let materialize_selection = std::rc::Rc::new(move |tint, open_note: bool| {
+        let Some(drag) = selection.get() else {
+            return;
+        };
+        if !drag.is_drag() {
+            return;
+        }
+        let Some(rendered) = rendered_pages
+            .get()
+            .get(drag.page)
+            .and_then(|slot| slot.get())
+        else {
+            return;
+        };
         let page_text = rendered.page_text.clone();
         let scale = READING_WIDTH_PT * zoom.get() / rendered.points.0;
-        if scale <= 0.0 { return; }
-        let Some(book_id) = books.get().iter()
+        if scale <= 0.0 {
+            return;
+        }
+        let Some(book_id) = books
+            .get()
+            .iter()
             .find(|book| book.path == path.get())
-            .map(|book| book.id.clone()) else { return; };
+            .map(|book| book.id.clone())
+        else {
+            return;
+        };
         let root = liber_core::default_root();
         spawn(async move {
-            let Some(measurement) = drag.page_ref.measure().await else { return; };
-            let origin = (measurement.page.x.0, measurement.page.y.0);
-            let local = |surface: (f32, f32)| {
-                ((surface.0 - origin.0) / scale, (surface.1 - origin.1) / scale)
-            };
             let Some(highlight) = page_text.highlight(
                 drag.page as u32,
-                local(drag.start_surface),
-                local(drag.end_surface),
-            ) else { return; };
-            let mut notes = liber_core::notes::Notes::open(&root, &book_id);
-            notes.add(highlight);
-            notes_snapshot.set(notes.items);
-            notes_snapshot_book.set(Some(book_id));
-            selection.set(None);
+                (drag.start_surface.0 / scale, drag.start_surface.1 / scale),
+                (drag.end_surface.0 / scale, drag.end_surface.1 / scale),
+            ) else {
+                return;
+            };
+            let mut highlight = highlight;
+            highlight.tint = tint;
+            if open_note {
+                note_comment.set(String::new());
+                note_draft.set(Some(highlight));
+            } else {
+                let mut notes = liber_core::notes::Notes::open(&root, &book_id);
+                notes.add(highlight);
+                notes_snapshot.set(notes.items);
+                notes_snapshot_book.set(Some(book_id));
+                selection.set(None);
+            }
         });
+    });
+    let save_note_draft = std::rc::Rc::new(move || {
+        let Some(mut highlight) = note_draft.get() else {
+            return;
+        };
+        let Some(book_id) = books
+            .get()
+            .iter()
+            .find(|book| book.path == path.get())
+            .map(|book| book.id.clone())
+        else {
+            return;
+        };
+        highlight.note = note_comment.get();
+        let mut notes = liber_core::notes::Notes::open(&liber_core::default_root(), &book_id);
+        notes.add(highlight);
+        notes_snapshot.set(notes.items);
+        notes_snapshot_book.set(Some(book_id));
+        note_comment.set(String::new());
+        note_draft.set(None);
+        selection.set(None);
     });
 
     let pending_pages = signal(Vec::<usize>::new());
@@ -385,7 +445,9 @@ fn window_app(reader_window: bool) -> impl IntoElement {
         render_preview: |path, at, zoom, tone, cancel| {
             liber_core::render_preview_cancellable(path, at, zoom, tone, cancel)
         },
-        render: |path, at, zoom, tone, cancel| liber_core::render_cancellable(path, at, zoom, tone, cancel),
+        render: |path, at, zoom, tone, cancel| {
+            liber_core::render_cancellable(path, at, zoom, tone, cancel)
+        },
         owner: Owner::current(),
     };
     let pages_for_view = reader_pages.clone();
@@ -405,24 +467,26 @@ fn window_app(reader_window: bool) -> impl IntoElement {
         let current_path = path;
         let pages = reading_pages;
         let pending = pending_text_pages;
-        text_owner.run(|| spawn(async move {
-            let page_path = source.clone();
-            let result = blocking(move || extract_page_text(page_path, at)).await;
-            let mut loading = pending.get();
-            loading.retain(|index| *index != at);
-            pending.set(loading);
-            if current_path.get() != source {
-                return;
-            }
-            if let Ok(Ok(text)) = result {
-                let mut cache = pages.get();
-                if cache.len() <= at {
-                    cache.resize(at + 1, None);
+        text_owner.run(|| {
+            spawn(async move {
+                let page_path = source.clone();
+                let result = blocking(move || extract_reading_blocks(page_path, at)).await;
+                let mut loading = pending.get();
+                loading.retain(|index| *index != at);
+                pending.set(loading);
+                if current_path.get() != source {
+                    return;
                 }
-                cache[at] = Some(text);
-                pages.set(cache);
-            }
-        }));
+                if let Ok(Ok(text)) = result {
+                    let mut cache = pages.get();
+                    if cache.len() <= at {
+                        cache.resize(at + 1, None);
+                    }
+                    cache[at] = Some(text);
+                    pages.set(cache);
+                }
+            })
+        });
     });
     let load_generation = signal(0u64);
     let preload_after_jump = request_page.clone();
@@ -433,7 +497,9 @@ fn window_app(reader_window: bool) -> impl IntoElement {
             .filter(|book_id| !book_id.is_empty())
         {
             if notes_snapshot_book.get().as_deref() != Some(book_id.as_str()) {
-                notes_snapshot.set(liber_core::notes::Notes::open(&liber_core::default_root(), &book_id).items);
+                notes_snapshot.set(
+                    liber_core::notes::Notes::open(&liber_core::default_root(), &book_id).items,
+                );
                 notes_snapshot_book.set(Some(book_id));
             }
         }
@@ -549,10 +615,15 @@ fn window_app(reader_window: bool) -> impl IntoElement {
             spawn(async move {
                 let result = blocking(move || -> Result<_, String> {
                     let (book, first_page) = import_pdf_with_first_page(&source)?;
-                    let rendered = if book.last_page == 0 && selected_tone == PageTone::Day {
-                        first_page
-                            .or_else(|| render(&book.path, 0, false).ok())
-                            .ok_or_else(|| "Не удалось отрисовать первую страницу".to_owned())?
+                    let rendered = if book.last_page == 0 {
+                        if selected_tone == PageTone::Day {
+                            first_page.or_else(|| {
+                                render_with_tone(&book.path, 0, 1.0, selected_tone).ok()
+                            })
+                        } else {
+                            render_with_tone(&book.path, 0, 1.0, selected_tone).ok()
+                        }
+                        .ok_or_else(|| "Не удалось отрисовать первую страницу".to_owned())?
                     } else {
                         render_with_tone(&book.path, book.last_page, 1.0, selected_tone)?
                     };
@@ -569,10 +640,10 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                         save_books(&list);
                         books.set(list);
                         open_reader_window(&book.path, &book.title);
-                        notes_snapshot.set(liber_core::notes::Notes::open(
-                            &liber_core::default_root(),
-                            &book.id,
-                        ).items);
+                        notes_snapshot.set(
+                            liber_core::notes::Notes::open(&liber_core::default_root(), &book.id)
+                                .items,
+                        );
                         notes_snapshot_book.set(Some(book.id.clone()));
                         path.set(book.path);
                         count.set(rendered.count);
@@ -580,9 +651,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                         let mut cache = vec![None; rendered.count];
                         cache[book.last_page] = Some(rendered.clone());
                         rendered_pages.set(cache.into_iter().map(signal).collect());
-                        let mut text_cache = vec![None; rendered.count];
-                        text_cache[book.last_page] = Some(rendered.text.clone());
-                        reading_pages.set(text_cache);
+                        reading_pages.set(vec![None; rendered.count]);
                         pending_pages.set(Vec::new());
                         pending_text_pages.set(Vec::new());
                         request_import(book.last_page);
@@ -611,14 +680,17 @@ fn window_app(reader_window: bool) -> impl IntoElement {
         std::rc::Rc::new(move |id: &str| match id {
             "home" => {
                 selected.set(None);
+                books.set(load_books());
                 section.set(Page::Home);
             }
             "all" => {
                 selected.set(None);
+                books.set(load_books());
                 section.set(Page::All);
             }
             "settings" => {
                 selected.set(None);
+                books.set(load_books());
                 section.set(Page::Settings);
             }
             "theme" => {
@@ -659,6 +731,9 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                 for command in imago_window_macos::reader_commands() {
                     match command {
                         imago_window_macos::ReaderCommand::Zoom(up) => {
+                            if text_mode.get() {
+                                continue;
+                            }
                             let next = if up {
                                 (zoom.get() + 0.25).min(3.0)
                             } else {
@@ -666,7 +741,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                             };
                             if (next - zoom.get()).abs() > 0.001 {
                                 zoom.set(next);
-                                rendered_pages.set((0..count.get()).map(|_| signal(None)).collect());
+                                rendered_pages
+                                    .set((0..count.get()).map(|_| signal(None)).collect());
                                 pending_pages.set(Vec::new());
                                 open_page(page.get());
                             }
@@ -675,13 +751,16 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                             if let Some(next) = READER_TONES.get(index).copied() {
                                 tone.set(next);
                                 save_tone(next);
-                                rendered_pages.set((0..count.get()).map(|_| signal(None)).collect());
+                                rendered_pages
+                                    .set((0..count.get()).map(|_| signal(None)).collect());
                                 pending_pages.set(Vec::new());
                                 open_page(page.get());
                             }
                         }
                         imago_window_macos::ReaderCommand::TextMode => {
                             let enabled = !text_mode.get();
+                            scroll_restore_page.set(page.get());
+                            restore_page_pending.set(true);
                             text_mode.set(enabled);
                             if enabled {
                                 request_text(page.get());
@@ -728,6 +807,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                 }
                 imago_window_macos::set_reader_state(imago_window_macos::ReaderState {
                     zoom_percent: (zoom.get() * 100.0).round() as u32,
+                    zoom_enabled: !text_mode.get(),
                     tones: READER_TONES
                         .iter()
                         .map(|tone| tone.label().to_owned())
@@ -823,7 +903,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                         .flex_1()
                         .min_w_0()
                         .flex_col()
-                        .child((!reader_window).then(|| 
+                        .child((!reader_window).then(||
                             view()
                                 .h(px(LIBRARY_BAR_HEIGHT))
                                 .flex_row()
@@ -835,6 +915,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                     button()
                                         .on_press(move || {
                                             selected.set(None);
+                                            books.set(load_books());
                                         })
                                         .child(view().flex_row().items_center().gap_2().child(icon(asset!("icons/book-open.svg").uri, 16.0, dark)).child(text("Библиотека"))),
                                 )
@@ -888,58 +969,6 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                 if let Some(book) = list.get(i) {
                                     let previous_page = load_prev.clone();
                                     let next_page = load_next.clone();
-                        let mut toc_entries = view().flex_col().gap_1();
-                        for (title, at, depth) in outline.get() {
-                            let jump = load_first.clone();
-                            let scroll_ref = reader_scroll_ref;
-                            toc_entries = toc_entries.child(
-                                button().on_press(move || {
-                                    scroll_ref.scroll_to_index(
-                                        at as u32,
-                                        nsh_core::geometry::Percentage(0.0),
-                                        px(0.0),
-                                        true,
-                                    );
-                                    jump(at);
-                                }).child(
-                                    view()
-                                        .w_full()
-                                        .py(px(8.0))
-                                        .pl(px(12.0 + 14.0 * depth.min(8) as f32))
-                                        .pr(px(12.0))
-                                        .rounded(px(6.0))
-                                        .child(
-                                            text(title)
-                                                .text_size(px(13.0))
-                                                .font_weight(if depth == 0 { FontWeight::MEDIUM } else { FontWeight::NORMAL })
-                                                .text_color(move || rgb(if dark.get() { LIBER_TEXT_DARK } else { LIBER_INK })),
-                                        ),
-                                ),
-                            );
-                        }
-                        if outline.get().is_empty() {
-                            toc_entries = toc_entries.child(
-                                text("В документе нет оглавления")
-                                    .text_size(px(13.0))
-                                    .text_color(move || rgb(if dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })),
-                            );
-                        }
-                        let mut result_entries = view().flex_col().gap_1();
-                        for hit in search_hits.get() {
-                            let jump = load_first.clone();
-                            let at = hit.page;
-                            let scroll_ref = reader_scroll_ref;
-                            result_entries = result_entries.child(
-                                button().on_press(move || {
-                                    scroll_ref.scroll_to_index(at as u32, nsh_core::geometry::Percentage(0.0), px(0.0), true);
-                                    jump(at);
-                                }).child(text(format!(
-                                    "{} · {}",
-                                    at + 1,
-                                    hit.excerpt
-                                )).text_size(px(11.0))),
-                            );
-                        }
                                     let highlights = notes_snapshot.get();
                                     if reader_window {
                                         // The reader window's notes popover lists the highlights, like its contents.
@@ -954,86 +983,94 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                 .collect(),
                                         );
                                     }
-                                    let mut note_entries = view().flex_col().gap_2();
-                                    if highlights.is_empty() {
-                                        note_entries = note_entries.child(
-                                            text("Заметок пока нет")
-                                                .text_size(px(13.0))
-                                                .text_color(move || rgb(if dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })),
-                                        );
-                                    }
-                                    for highlight in highlights {
-                                        let jump = load_first.clone();
-                                        let scroll_ref = reader_scroll_ref;
-                                        let at = highlight.page as usize;
-                                        note_entries = note_entries.child(
-                                            button().on_press(move || {
-                                                scroll_ref.scroll_to_index(
-                                                    at as u32,
-                                                    nsh_core::geometry::Percentage(0.0),
-                                                    px(0.0),
-                                                    true,
-                                                );
-                                                jump(at);
-                                            }).child(
-                                                view()
-                                                    .w_full()
-                                                    .p(px(10.0))
-                                                    .rounded(px(6.0))
-                                                    .flex_col()
-                                                    .gap_1()
-                                                    .child(
-                                                        text(format!("стр. {}", at + 1))
-                                                            .text_size(px(11.0))
-                                                            .text_color(move || rgb(if dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })),
-                                                    )
-                                                    .child(
-                                                        text(highlight.text.clone())
-                                                            .text_size(px(13.0))
-                                                            .text_color(move || rgb(if dark.get() { LIBER_TEXT_DARK } else { LIBER_INK })),
-                                                    )
-                                                    .child(
-                                                        text(highlight.note.clone())
-                                                            .text_size(px(12.0))
-                                                            .text_color(move || rgb(if dark.get() { LIBER_TEXT_DARK } else { LIBER_INK })),
-                                                    ),
-                                            ),
-                                        );
-                                    }
-                                    // The padding sits inside a fixed-width view: padding on the
-                                    // panel itself would keep 40pt when the panel is closed.
-                                    let notes_panel = view()
-                                        .w(move || px(if notes_sidebar_open.get() { READER_PANEL_WIDTH } else { 0.0 }))
-                                        .overflow_hidden()
-                                        .bg(move || rgb(if dark.get() { LIBER_SURFACE_DARK } else { LIBER_PANEL_LIGHT }))
-                                        .flex_col()
-                                        .child(view()
+                                    let panel_highlights = highlights.clone();
+                                    let panel_open = notes_sidebar_open;
+                                    let panel_dark = dark;
+                                    let panel_scroll = reader_scroll_ref;
+                                    let panel_jump = load_first.clone();
+                                    let notes_panel = dynamic(move || {
+                                        if !panel_open.get() {
+                                            return view().w(px(0.0)).min_w(px(0.0)).into_element();
+                                        }
+                                        let mut note_entries = view().flex_col().gap_2();
+                                        if panel_highlights.is_empty() {
+                                            note_entries = note_entries.child(
+                                                text("Заметок пока нет")
+                                                    .text_size(px(13.0))
+                                                    .text_color(move || rgb(if panel_dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })),
+                                            );
+                                        }
+                                        for highlight in panel_highlights.iter().cloned() {
+                                            let jump = panel_jump.clone();
+                                            let scroll_ref = panel_scroll;
+                                            let at = highlight.page as usize;
+                                            note_entries = note_entries.child(
+                                                button().on_press(move || {
+                                                    scroll_ref.scroll_to_index(
+                                                        at as u32,
+                                                        nsh_core::geometry::Percentage(0.0),
+                                                        px(0.0),
+                                                        true,
+                                                    );
+                                                    jump(at);
+                                                }).child(
+                                                    view()
+                                                        .w_full()
+                                                        .p(px(10.0))
+                                                        .rounded(px(6.0))
+                                                        .flex_col()
+                                                        .gap_1()
+                                                        .child(
+                                                            text(format!("стр. {}", at + 1))
+                                                                .text_size(px(11.0))
+                                                                .text_color(move || rgb(if panel_dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })),
+                                                        )
+                                                        .child(
+                                                            text(highlight.text.clone())
+                                                                .text_size(px(13.0))
+                                                                .text_color(move || rgb(if panel_dark.get() { LIBER_TEXT_DARK } else { LIBER_INK })),
+                                                        )
+                                                        .child(
+                                                            text(highlight.note.clone())
+                                                                .text_size(px(12.0))
+                                                                .text_color(move || rgb(if panel_dark.get() { LIBER_TEXT_DARK } else { LIBER_INK })),
+                                                        ),
+                                                ),
+                                            );
+                                        }
+                                        view()
                                             .w(px(READER_PANEL_WIDTH))
-                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .overflow_hidden()
+                                            .bg(move || rgb(if panel_dark.get() { LIBER_SURFACE_DARK } else { LIBER_PANEL_LIGHT }))
                                             .flex_col()
-                                            .p(px(20.0))
-                                            .gap_3()
-                                            .child(when(move || notes_sidebar_open.get(), move || view()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .child(text("Заметки").text_size(px(16.0)).font_weight(FontWeight::SEMIBOLD))
-                                                    .child(
-                                                        button()
-                                                            .on_press(move || {
-                                                                animate_layout(nsh_core::LayoutAnimation::EASE_IN_EASE_OUT);
-                                                                notes_sidebar_open.set(false);
-                                                            })
-                                                            .child(icon(asset!("icons/status-x.svg").uri, 16.0, dark)),
-                                                    )))
-                                            .child(scroll().flex_1().child(note_entries)));
+                                            .child(view()
+                                                .w(px(READER_PANEL_WIDTH))
+                                                .flex_1()
+                                                .flex_col()
+                                                .p(px(20.0))
+                                                .gap_3()
+                                                .child(view()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .child(text("Заметки").text_size(px(16.0)).font_weight(FontWeight::SEMIBOLD))
+                                                        .child(
+                                                            button()
+                                                                .on_press(move || {
+                                                                    animate_layout(nsh_core::LayoutAnimation::EASE_IN_EASE_OUT);
+                                                                    panel_open.set(false);
+                                                                })
+                                                                .child(icon(asset!("icons/status-x.svg").uri, 16.0, panel_dark)),
+                                                        ))
+                                                .child(scroll().flex_1().child(note_entries)))
+                                            .into_element()
+                                    });
             let bar_load = load_first.clone();
             let bar_request = request_text_for_reader.clone();
             let bar_previous = previous_page.clone();
             let bar_next = next_page.clone();
             let bar_title = book.title.clone();
-            let bar_note_action_enabled = note_action_enabled.clone();
-            let bar_save_selection_note = save_selection_note.clone();
             let bar_row = std::rc::Rc::new(move || {
                 let bar_previous = bar_previous.clone();
                 let bar_next = bar_next.clone();
@@ -1050,6 +1087,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                 .child((!reader_window).then(|| button()
                                                         .on_press(move || {
                                                             selected.set(None);
+                                                            books.set(load_books());
                                                         })
                                                         .child(view().flex_row().items_center().gap_2().child(icon(asset!("icons/arrow-left.svg").uri, 16.0, dark)).child(text("Библиотека")))))
                                                 .child((!reader_window).then(|| text(bar_title.clone()).text_size(px(14.0))))
@@ -1065,7 +1103,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                         reopen(page.get());
                                                     }
                                                 }).child(text(move || tone.get().label())))
-                                                .child(button().on_press({
+                                                .child(button().disabled(move || text_mode.get()).on_press({
                                                     let reopen = bar_load.clone();
                                                     move || {
                                                         let next = (zoom.get() - 0.25).max(0.5);
@@ -1077,8 +1115,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                         }
                                                     }
                                                 }).child(text("−")))
-                                                .child(text(move || format!("{}%", (zoom.get() * 100.0).round() as u32)).text_size(px(12.0)))
-                                                .child(button().on_press({
+                                                .child(when(move || !text_mode.get(), move || text(move || format!("{}%", (zoom.get() * 100.0).round() as u32)).text_size(px(12.0))))
+                                                .child(button().disabled(move || text_mode.get()).on_press({
                                                     let reopen = bar_load.clone();
                                                     move || {
                                                         let next = (zoom.get() + 0.25).min(3.0);
@@ -1096,6 +1134,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                             let request = bar_request.clone();
                                                             move || {
                                                                 let enabled = !text_mode.get();
+                                                                scroll_restore_page.set(page.get());
+                                                                restore_page_pending.set(true);
                                                                 text_mode.set(enabled);
                                                                 if enabled {
                                                                     request(page.get());
@@ -1148,18 +1188,6 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                 .child(text("Копировать")),
                                                         ),
                                                 )
-                                                .child(
-                                                    button()
-                                                        .disabled({
-                                                            let enabled = bar_note_action_enabled.clone();
-                                                            move || !enabled()
-                                                        })
-                                                        .on_press({
-                                                            let save = bar_save_selection_note.clone();
-                                                            move || save()
-                                                        })
-                                                        .child(text("Заметка")),
-                                                )
                                                 .child(button().on_press(move || {
                                                     animate_layout(nsh_core::LayoutAnimation::EASE_IN_EASE_OUT);
                                                     notes_sidebar_open.set(!notes_sidebar_open.get());
@@ -1173,11 +1201,13 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                             .child(text(message))
                                             .into_element();
                                     }
+                                    let note_action_enabled = note_action_enabled.clone();
+                                    let materialize_selection = materialize_selection.clone();
                                     return view()
                                         .flex_1()
                                         .relative()
                                         .flex_col()
-                                        .bg(move || rgb(reader_tone_color(tone.get(), dark.get())))
+                                        .bg(move || rgb(reader_tone_color(tone.get())))
                                         .child(reader_window.then(|| view()
                                             .absolute()
                                             .top(px(0.0))
@@ -1185,12 +1215,12 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                             .z_index(1)
                                             .h(px(READER_DIM_HEIGHT))
                                             .bg_linear_to_b()
-                                            .gradient_from(move || rgb(reader_tone_color(tone.get(), dark.get())))
-                                            .gradient_via(move || rgb(reader_tone_color(tone.get(), dark.get())))
+                                            .gradient_from(move || rgb(reader_tone_color(tone.get())))
+                                            .gradient_via(move || rgb(reader_tone_color(tone.get())))
                                             .gradient_via_position(Percentage(READER_DIM_SOLID))
                                             .window_drag(true)))
                                         .child(view()
-                                                .h(move || px(if reader_window || sidebar::system() { 0.0 } else { READER_BAR_HEIGHT }))
+                                                .h(move || px(if reader_window { 0.0 } else { READER_BAR_HEIGHT }))
                                                 .overflow_hidden()
                                                 .child((*bar_row)()))
                                         .child(
@@ -1199,36 +1229,87 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                 .flex_row_reverse()
                                                 .min_h_0()
                                                 .child(notes_panel)
-                                                .child(dynamic(move || {
+                                                .child(dynamic({
+                                                    let record_page = record_page.clone();
+                                                    move || {
+                                                    let note_action_enabled = note_action_enabled.clone();
+                                                    let materialize_selection = materialize_selection.clone();
                                                     if text_mode.get() {
                                                         virtual_list(move || count.get(), move |position| {
                                                             let position = position;
                                                             dynamic(move || {
                                                                 let index = position.index();
-                                                                let body = reading_pages.get().get(index).cloned().flatten();
-                                                                let Some(body) = body else {
+                                                                let blocks = reading_pages.get().get(index).cloned().flatten();
+                                                                let Some(blocks) = blocks else {
                                                                     return view().w_full().h(px(220.0)).items_center().justify_center()
-                                                                        .child(text("Загрузка текста…").text_color(rgb(LIBER_MUTED_LIGHT))).into_element();
+                                                                        .child(text("Загрузка текста…").text_color(rgb(tone.get().palette().muted_ink))).into_element();
                                                                 };
-                                                                view().w_full().flex_row().justify_center().py(px(SPACE_36)).selection_area(true).child(
-                                                                    text(body)
-                                                                        .max_w(px(700.0))
-                                                                        .font_family("Georgia")
-                                                                        .text_size(px(19.0))
-                                                                        .line_height(px(31.0))
+                                                                let mut content = view().w_full().max_w(px(700.0)).flex().flex_col().gap(px(18.0));
+                                                                for paragraph in blocks {
+                                                                    let code = paragraph.code;
+                                                                    let paragraph_text = paragraph.text;
+                                                                    let syntax = paragraph.syntax;
+                                                                    let mut block = text(if code { String::new() } else { paragraph_text.clone() })
+                                                                        .font_family(if code { "Menlo" } else { "Georgia" })
+                                                                        .text_size(px(if code { 16.0 } else { 19.0 }))
+                                                                        .line_height(px(if code { 25.0 } else { 31.0 }))
+                                                                        .app_class(if code { Some("whitespace-nowrap".into()) } else { None })
                                                                         .selectable(true)
-                                                                        .selection_color(rgb(LIBER_ACCENT)),
-                                                                ).into_element()
+                                                                        .text_color(move || rgb(tone.get().palette().ink))
+                                                                        .selection_color(rgb(tone.get().palette().accent));
+                                                                    if code {
+                                                                        let mut cursor = 0;
+                                                                        for span in syntax {
+                                                                            if span.start < cursor
+                                                                                || span.end > paragraph_text.len()
+                                                                                || !paragraph_text.is_char_boundary(span.start)
+                                                                                || !paragraph_text.is_char_boundary(span.end)
+                                                                            {
+                                                                                continue;
+                                                                            }
+                                                                            if cursor < span.start {
+                                                                                block = block.child(text(paragraph_text[cursor..span.start].to_owned())
+                                                                                    .app_class("whitespace-nowrap"));
+                                                                            }
+                                                                            block = block.child(text(paragraph_text[span.start..span.end].to_owned())
+                                                                                .app_class("whitespace-nowrap")
+                                                                                .text_color(rgb(tone.get().palette().code_ink(span.token))));
+                                                                            cursor = span.end;
+                                                                        }
+                                                                        if cursor < paragraph_text.len() {
+                                                                            block = block.child(text(paragraph_text[cursor..].to_owned())
+                                                                                .app_class("whitespace-nowrap"));
+                                                                        }
+                                                                    }
+                                                                    content = content.child(
+                                                                        view().w_full()
+                                                                            .when(code, |block| block
+                                                                                .min_w_0()
+                                                                                .app_class("overflow-x-auto")
+                                                                                .bg(rgb(tone.get().palette().code_paper))
+                                                                                .p(px(12.0)))
+                                                                            .child(block),
+                                                                    );
+                                                                }
+                                                                view().w_full().flex_row().justify_center().py(px(SPACE_36)).selection_area(true)
+                                                                    .child(content).into_element()
                                                             })
                                                         })
                                                         .estimated_item_size(px(700.0))
-                                                        .initial_scroll_index(initial_page)
+                                                        .initial_scroll_index(scroll_restore_page.get())
+                                                        .element_ref(&reader_scroll_ref)
                                                         .on_viewable_items_change({
                                                             let request = request_text_for_reader.clone();
-                                                            let current_page = page;
+                                                            let record_page = record_page.clone();
+                                                            let restore_pending = restore_page_pending;
+                                                            let restore_page = scroll_restore_page;
                                                             move |items: &ViewableItems| {
                                                                 if let Some((first, last)) = items.viewable {
-                                                                    current_page.set(first);
+                                                                    if restore_pending.get() {
+                                                                        if first != restore_page.get() { return; }
+                                                                        restore_pending.set(false);
+                                                                    }
+                                                                    record_page(first);
                                                                     for index in first.saturating_sub(1)..=last.saturating_add(1).min(count.get().saturating_sub(1)) {
                                                                         request(index);
                                                                     }
@@ -1238,22 +1319,51 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                         .flex_1()
                                                         .into_element()
                                                     } else {
-                                                        scroll().flex_1().horizontal().child(
-                                                            view().w_full().min_w(px(680.0 * zoom.get())).flex_row().justify_center().child(
+                                                        scroll().flex_1().w_full().horizontal().center_content(true)
+                                                            .on_layout(move |bounds: &Bounds<Points>| {
+                                                                let width = bounds.size.width.0;
+                                                                if (reader_viewport_width.get() - width).abs() > 1.0 {
+                                                                    reader_viewport_width.set(width);
+                                                                }
+                                                            })
+                                                            .pinch_value(&gesture_zoom)
+                                                            .on_pinch_end({
+                                                                let gesture_zoom = gesture_zoom;
+                                                                let zoom = zoom;
+                                                                move |event: &GestureEvent| {
+                                                                    zoom.set((zoom.get() * event.value).clamp(0.5, 3.0));
+                                                                    gesture_zoom.set(1.0);
+                                                                }
+                                                            })
+                                                            .child(
+                                                            view().bind_scale(&gesture_zoom).w_full().min_w(px(680.0 * zoom.get())).flex_row().justify_center().child(
                                                         virtual_list(move || count.get(), move |position| {
                                                             let position = position;
+                                                            let note_action_enabled = note_action_enabled.clone();
+                                                            let materialize_selection = materialize_selection.clone();
                                                             dynamic(move || {
                                                                 let index = position.index();
                                                                 let rendered = rendered_pages.get().get(index).and_then(|slot| slot.get());
                                                                 let Some(rendered) = rendered else {
                                                                     let scale = zoom.get();
-                                                                    return view().w(px(680.0 * scale)).h(px(980.0 * scale)).items_center().justify_center()
-                                                                        .child(text("Загрузка страницы…").text_color(rgb(LIBER_MUTED_LIGHT))).into_element();
+                                                                    let viewport_width = reader_viewport_width.get();
+                                                                    let display_width = 680.0 * scale;
+                                                                    let row_width = viewport_width.max(display_width);
+                                                                    let left_inset = ((viewport_width - display_width) / 2.0).max(0.0);
+                                                                    return view().relative().w(px(row_width)).h(px(980.0 * scale)).child(
+                                                                        view().absolute().left(px(left_inset)).top(px(0.0))
+                                                                            .w(px(display_width)).h(px(980.0 * scale))
+                                                                            .items_center().justify_center()
+                                                                            .child(text("Загрузка страницы…").text_color(rgb(LIBER_MUTED_LIGHT)))
+                                                                    ).into_element();
                                                                 };
                                                                 let (width, height) = rendered.size;
                                                                 if width == 0 { return view().h(px(980.0)).into_element(); }
                                                                 // MuPDF text geometry uses page points; the tiles are rendered at device density for this width.
                                                                 let display_width = READING_WIDTH_PT * zoom.get();
+                                                                let viewport_width = reader_viewport_width.get();
+                                                                let row_width = viewport_width.max(display_width);
+                                                                let left_inset = ((viewport_width - display_width) / 2.0).max(0.0);
                                                                 let scale = display_width / rendered.points.0;
                                                                 let image_height = display_width * height as f32 / width as f32;
                                                                 let saved_highlights = notes_snapshot.get();
@@ -1269,19 +1379,45 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                             .bg(rgb(highlight.tint.hex()).opacity(0.28)));
                                                                     }
                                                                 }
-                                                                let mut selectable = view().absolute().inset_0();
-                                                                for run in rendered.text_runs {
-                                                                    let font_size = (run.size as f32 * scale).clamp(6.0, 48.0);
-                                                                    selectable = selectable.child(text(run.text).absolute()
-                                                                        .left(px(run.x as f32 * scale))
-                                                                        .top(px((run.y as f32 - run.size as f32 * 0.82) * scale))
-                                                                        .text_size(px(font_size)).text_color(rgb(LIBER_INK).opacity(0.0))
-                                                                        .selectable(true).selection_color(rgb(LIBER_ACCENT)));
+                                                                if let Some(drag) = selection.get().filter(|drag| {
+                                                                    drag.page == index && drag.is_drag()
+                                                                }) {
+                                                                    let start = rendered.page_text.hit(
+                                                                        drag.start_surface.0 / scale,
+                                                                        drag.start_surface.1 / scale,
+                                                                    );
+                                                                    let end = rendered.page_text.hit(
+                                                                        drag.end_surface.0 / scale,
+                                                                        drag.end_surface.1 / scale,
+                                                                    );
+                                                                    if let (Some(start), Some(end)) = (start, end) {
+                                                                        for rect in rendered.page_text.rects(start, end) {
+                                                                            highlight_overlay = highlight_overlay.child(view().absolute()
+                                                                                .left(px(rect[0] * scale))
+                                                                                .top(px(rect[1] * scale))
+                                                                                .w(px((rect[2] - rect[0]) * scale))
+                                                                                .h(px((rect[3] - rect[1]) * scale))
+                                                                                .bg(rgb(LIBER_ACCENT).opacity(0.28)));
+                                                                        }
+                                                                    }
                                                                 }
-                                                                let page_ref = element_ref();
-                                                                let body = view().relative().selection_area(true).w(px(display_width)).h(px(image_height));
+                                                                let body = view().relative().w(px(display_width)).h(px(image_height));
                                                                 #[cfg(target_os = "macos")]
                                                                 let body = {
+                                                                    let selection_text = selection.get()
+                                                                        .filter(|drag| drag.page == index && drag.is_drag())
+                                                                        .and_then(|drag| {
+                                                                            let start = rendered.page_text.hit(
+                                                                                drag.start_surface.0 / scale,
+                                                                                drag.start_surface.1 / scale,
+                                                                            )?;
+                                                                            let end = rendered.page_text.hit(
+                                                                                drag.end_surface.0 / scale,
+                                                                                drag.end_surface.1 / scale,
+                                                                            )?;
+                                                                            Some(rendered.page_text.text(start, end))
+                                                                        })
+                                                                        .unwrap_or_default();
                                                                     let tiles: Vec<JsonValue> = rendered
                                                                         .tiles
                                                                         .iter()
@@ -1295,14 +1431,51 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                             })
                                                                         })
                                                                         .collect();
-                                                                    body.child(
-                                                                        nsh_core::ui::prelude::native(page_view::NAME)
+                                                                    let event_selection = selection;
+                                                                    let event_materialize = materialize_selection.clone();
+                                                                    let native_page = nsh_core::ui::prelude::native(page_view::NAME)
                                                                             .absolute()
                                                                             .inset_0()
                                                                             .prop("preview", json!(rendered.png))
                                                                             .prop("size", json!([rendered.points.0, rendered.points.1]))
-                                                                            .prop("tiles", JsonValue::Array(tiles)),
-                                                                    )
+                                                                            .prop("tiles", JsonValue::Array(tiles))
+                                                                            .prop("menuEnabled", json!(note_action_enabled()))
+                                                                            .prop("selectionText", json!(selection_text));
+                                                                    let native_page = native_page.on_native_event(move |event: &NativeEvent| {
+                                                                        let point = || {
+                                                                            let values = event.data.as_array()?;
+                                                                            Some((values.first()?.as_f64()? as f32, values.get(1)?.as_f64()? as f32))
+                                                                        };
+                                                                        match event.name.as_ref() {
+                                                                            "selectionStart" => {
+                                                                                if let Some((x, y)) = point() {
+                                                                                    event_selection.set(Some(SelectionDrag {
+                                                                                        page: index,
+                                                                                        start_surface: (x, y),
+                                                                                        end_surface: (x, y),
+                                                                                    }));
+                                                                                }
+                                                                            }
+                                                                            "selectionMove" | "selectionEnd" => {
+                                                                                if let (Some((x, y)), Some(mut drag)) = (point(), event_selection.get()) {
+                                                                                    if drag.page == index {
+                                                                                        drag.end_surface = (x, y);
+                                                                                        event_selection.set(Some(drag));
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            "selectionAction" => match event.data.as_str() {
+                                                                                Some("yellow") => event_materialize(liber_core::notes::Tint::Yellow, false),
+                                                                                Some("green") => event_materialize(liber_core::notes::Tint::Green, false),
+                                                                                Some("blue") => event_materialize(liber_core::notes::Tint::Blue, false),
+                                                                                Some("pink") => event_materialize(liber_core::notes::Tint::Pink, false),
+                                                                                Some("note") => event_materialize(liber_core::notes::Tint::Yellow, true),
+                                                                                _ => {}
+                                                                            },
+                                                                            _ => {}
+                                                                        }
+                                                                    });
+                                                                    body.child(native_page)
                                                                 };
                                                                 #[cfg(not(target_os = "macos"))]
                                                                 let body = {
@@ -1318,48 +1491,29 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                     }
                                                                     body.child(image(rendered.png.clone()).w(px(display_width)).h(px(image_height))).child(tiles)
                                                                 };
-                                                                let selection = selection;
-                                                                let body = body.child(highlight_overlay).child(selectable)
-                                                                    .element_ref(&page_ref)
-                                                                    .on_touch(move |event: &TouchEvent| {
-                                                                        if event.phase == TouchPhase::Cancel {
-                                                                            selection.set(None);
-                                                                            return;
-                                                                        }
-                                                                        let Some(point) = event.points.iter().find(|point| point.changed) else { return; };
-                                                                        let surface = (point.page.x.0, point.page.y.0);
-                                                                        match event.phase {
-                                                                            TouchPhase::Start => selection.set(Some(SelectionDrag {
-                                                                                page: index,
-                                                                                start_surface: surface,
-                                                                                end_surface: surface,
-                                                                                page_ref,
-                                                                            })),
-                                                                            TouchPhase::Move | TouchPhase::End => {
-                                                                                if let Some(mut drag) = selection.get() {
-                                                                                    if drag.page == index {
-                                                                                        drag.end_surface = surface;
-                                                                                        selection.set(Some(drag));
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                            TouchPhase::Cancel => selection.set(None),
-                                                                        }
-                                                                    });
-                                                                view().w_full().flex_row().justify_center().child(body).into_element()
+                                                                view().relative().w(px(row_width)).h(px(image_height))
+                                                                    .child(body.absolute().left(px(left_inset)).top(px(0.0))
+                                                                        .child(highlight_overlay))
+                                                                    .into_element()
                                                             })
                                                         })
                                                         .estimated_item_size(move || px(980.0 * zoom.get()))
                                                         .row_gap(px(SPACE_22))
                                                         .content_padding_y(px(SPACE_22))
-                                                        .initial_scroll_index(initial_page)
+                                                        .initial_scroll_index(scroll_restore_page.get())
                                                         .element_ref(&reader_scroll_ref)
                                                         .on_viewable_items_change({
                                                             let pages = pages_for_reader.clone();
-                                                            let current_page = page;
+                                                            let record_page = record_page.clone();
+                                                            let restore_pending = restore_page_pending;
+                                                            let restore_page = scroll_restore_page;
                                                             move |items: &ViewableItems| {
                                                                 if let Some((first, last)) = items.viewable {
-                                                                    current_page.set(first);
+                                                                    if restore_pending.get() {
+                                                                        if first != restore_page.get() { return; }
+                                                                        restore_pending.set(false);
+                                                                    }
+                                                                    record_page(first);
                                                                     pages.show(first, last);
                                                                 }
                                                             }
@@ -1368,8 +1522,63 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                             )
                                                         ).into_element()
                                                     }
-                                                }))
-                                                .child((!reader_window).then(|| view().w(move || px(if !sidebar::system() && outline_sidebar_open.get() { READER_PANEL_WIDTH } else { 0.0 }))
+                                                } }))
+                                                .child({
+                                                    let outline_panel_load = load_first.clone();
+                                                    let outline_panel_outline = outline;
+                                                    let outline_panel_hits = search_hits;
+                                                    when(
+                                                    move || !reader_window && !sidebar::system() && outline_sidebar_open.get(),
+                                                    move || {
+                                                        let mut toc_entries = view().flex_col().gap_1();
+                                                        for (title, at, depth) in outline_panel_outline.get() {
+                                                            let jump = outline_panel_load.clone();
+                                                            let scroll_ref = reader_scroll_ref;
+                                                            toc_entries = toc_entries.child(
+                                                                button().on_press(move || {
+                                                                    scroll_ref.scroll_to_index(
+                                                                        at as u32,
+                                                                        nsh_core::geometry::Percentage(0.0),
+                                                                        px(0.0),
+                                                                        true,
+                                                                    );
+                                                                    jump(at);
+                                                                }).child(
+                                                                    view()
+                                                                        .w_full()
+                                                                        .py(px(8.0))
+                                                                        .pl(px(12.0 + 14.0 * depth.min(8) as f32))
+                                                                        .pr(px(12.0))
+                                                                        .rounded(px(6.0))
+                                                                        .child(
+                                                                            text(title)
+                                                                                .text_size(px(13.0))
+                                                                                .font_weight(if depth == 0 { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                                                                                .text_color(move || rgb(if dark.get() { LIBER_TEXT_DARK } else { LIBER_INK })),
+                                                                        ),
+                                                                ),
+                                                            );
+                                                        }
+                                                        if outline_panel_outline.get().is_empty() {
+                                                            toc_entries = toc_entries.child(
+                                                                text("В документе нет оглавления")
+                                                                    .text_size(px(13.0))
+                                                                    .text_color(move || rgb(if dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })),
+                                                            );
+                                                        }
+                                                        let mut result_entries = view().flex_col().gap_1();
+                                                        for hit in outline_panel_hits.get() {
+                                                            let jump = outline_panel_load.clone();
+                                                            let at = hit.page;
+                                                            let scroll_ref = reader_scroll_ref;
+                                                            result_entries = result_entries.child(
+                                                                button().on_press(move || {
+                                                                    scroll_ref.scroll_to_index(at as u32, nsh_core::geometry::Percentage(0.0), px(0.0), true);
+                                                                    jump(at);
+                                                                }).child(text(format!("{} · {}", at + 1, hit.excerpt)).text_size(px(11.0))),
+                                                            );
+                                                        }
+                                                        view().w(px(READER_PANEL_WIDTH))
                                                         .overflow_hidden()
                                                         .bg(move || {
                                                             rgb(if dark.get() {
@@ -1452,19 +1661,78 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                     .line_height(px(22.0)),
                                                             ),
                                                         ).into_element()
-                                                ))
-                                                .child(reader_window.then(|| {
-                                                    let enabled = note_action_enabled.clone();
-                                                    let save = save_selection_note.clone();
-                                                    view().absolute()
-                                                        .top(px(8.0))
-                                                        .right(move || px(if notes_sidebar_open.get() { READER_PANEL_WIDTH + 16.0 } else { 16.0 }))
-                                                        .z_index(3)
-                                                        .child(button()
-                                                            .disabled(move || !enabled())
-                                                            .on_press(move || save())
-                                                            .child(text("Заметка")))
-                                                }))
+                                                    }
+                                                )})
+                                                .child({
+                                                    let save_note_draft = save_note_draft.clone();
+                                                    when(
+                                                    move || note_draft.get().is_some(),
+                                                    move || {
+                                                        let save = save_note_draft.clone();
+                                                        view()
+                                                            .absolute()
+                                                            .inset_0()
+                                                            .z_index(10)
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .bg(rgb(0x000000).opacity(0.62))
+                                                            .child(
+                                                                view()
+                                                                    .w(px(720.0))
+                                                                    .h(px(480.0))
+                                                                    .flex_col()
+                                                                    .gap_4()
+                                                                    .p(px(24.0))
+                                                                    .rounded(px(18.0))
+                                                                    .bg(move || rgb(if dark.get() { 0x1C1C1E } else { 0xF5F5F7 }))
+                                                                    .child(text("Заметка").text_size(px(18.0)).font_weight(FontWeight::SEMIBOLD))
+                                                                    .child(
+                                                                        view()
+                                                                            .flex_row()
+                                                                            .gap_3()
+                                                                            .p(px(12.0))
+                                                                            .rounded(px(8.0))
+                                                                            .bg(move || rgb(if dark.get() { 0x252529 } else { 0xE7E7EA }))
+                                                                            .child(view().w(px(3.0)).rounded(px(2.0)).bg(move || rgb(note_draft.get().map_or(liber_core::notes::Tint::Yellow, |draft| draft.tint).hex())))
+                                                                            .child(text(move || note_draft.get().map_or_else(String::new, |draft| draft.text)).text_size(px(14.0)).line_height(px(21.0)).text_color(rgb(LIBER_MUTED_DARK))),
+                                                                    )
+                                                                    .child(
+                                                                        input()
+                                                                            .multiline(true)
+                                                                            .h(px(180.0))
+                                                                            .value(move || note_comment.get())
+                                                                            .placeholder("Добавить заметку…")
+                                                                            .on_change(move |value: &str| note_comment.set(value.to_owned())),
+                                                                    )
+                                                                    .child(view().flex_1())
+                                                                    .child(
+                                                                        view().flex_row().justify_end().gap_2()
+                                                                            .child(
+                                                                                nsh_core::ui::prelude::native(page_view::NOTE_BUTTON)
+                                                                                    .w(px(92.0)).h(px(32.0))
+                                                                                    .prop("title", json!("Отмена"))
+                                                                                    .prop("action", json!("cancel"))
+                                                                                    .on_native_event(move |event: &NativeEvent| {
+                                                                                        if event.data.as_str() == Some("cancel") {
+                                                                                            note_draft.set(None);
+                                                                                        }
+                                                                                    }),
+                                                                            )
+                                                                            .child(
+                                                                                nsh_core::ui::prelude::native(page_view::NOTE_BUTTON)
+                                                                                    .w(px(72.0)).h(px(32.0))
+                                                                                    .prop("title", json!("OK"))
+                                                                                    .prop("action", json!("save"))
+                                                                                    .on_native_event(move |event: &NativeEvent| {
+                                                                                        if event.data.as_str() == Some("save") {
+                                                                                            save();
+                                                                                        }
+                                                                                    }),
+                                                                            ),
+                                                                    ),
+                                                            )
+                                                    },
+                                                )})
                                         ).into_element();
                                 }
                             }

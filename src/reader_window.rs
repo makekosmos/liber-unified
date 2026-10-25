@@ -18,7 +18,11 @@ pub fn evict(cached: &[bool], window: &RangeInclusive<usize>) -> Vec<usize> {
 }
 
 /// Pages in the window that are neither rendered nor already queued.
-pub fn to_request(window: &RangeInclusive<usize>, cached: &[bool], pending: &[usize]) -> Vec<usize> {
+pub fn to_request(
+    window: &RangeInclusive<usize>,
+    cached: &[bool],
+    pending: &[usize],
+) -> Vec<usize> {
     window
         .clone()
         .filter(|index| !cached.get(*index).copied().unwrap_or(false) && !pending.contains(index))
@@ -90,9 +94,9 @@ mod tests {
                 cached[page] = true;
             }
         }
-        assert!(renders.iter().all(|&n| n == 1), "renders per page: {renders:?}");
+        assert!(
+            renders.iter().all(|&n| n == 1),
+            "renders per page: {renders:?}"
+        );
     }
-
-
-
 }

@@ -32,7 +32,7 @@ nsh-platform-linux = { version = "0.2.0", default-features = false }
 nsh-platform-macos = { version = "0.2.0", default-features = false }
 imago-window-macos = { path = "../imago-sidebar-wt/crates/imago-window-macos" }
 objc2 = "=0.6.5"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSGraphics", "NSImage", "NSResponder", "NSView"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSBezierPath", "NSButton", "NSButtonCell", "NSColor", "NSControl", "NSGraphics", "NSImage", "NSMenu", "NSMenuItem", "NSEvent", "NSResponder", "NSView", "NSWindow"] }
 objc2-foundation = "0.3.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
