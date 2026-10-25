@@ -169,10 +169,15 @@ static READER_BOOK: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Opens `source` in a reader window titled `title`.
 pub fn open_reader_window(source: &str, title: &str) {
-    *READER_BOOK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = Some(PathBuf::from(source));
-    imago_window_macos::open_reader(title, source);
+    #[cfg(target_os = "macos")]
+    {
+        *READER_BOOK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(PathBuf::from(source));
+        imago_window_macos::open_reader(title, source);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (source, title);
 }
 
 /// Opens the book named by `LIBER_OPEN_PDF`, imported if it is new, in a reader window.
@@ -713,6 +718,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
         )
     };
     let sidebar_hidden = signal(false);
+    #[cfg(target_os = "macos")]
     if reader_window {
         // The contents popover's picks and the toolbar's requests reach the reader here, a few times a second.
         nsh_core::ui::ambient::set_interval(std::time::Duration::from_millis(30), {
@@ -820,7 +826,9 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                 });
             }
         });
-    } else if sidebar::system() {
+    }
+    #[cfg(target_os = "macos")]
+    if !reader_window && sidebar::system() {
         // The system sidebar's picks and visibility reach the app here, a few times a second.
         nsh_core::ui::ambient::set_interval(std::time::Duration::from_millis(30), {
             let press = sidebar_press.clone();
@@ -954,6 +962,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                         .child(dynamic(move || {
                             let request_text_for_reader = request_text_page.clone();
                             let pages_for_reader = pages_for_view.clone();
+                            #[cfg(target_os = "macos")]
                             if reader_window {
                                 // The reader window's contents popover lists the open book's contents.
                                 imago_window_macos::set_contents(
@@ -970,6 +979,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                     let previous_page = load_prev.clone();
                                     let next_page = load_next.clone();
                                     let highlights = notes_snapshot.get();
+                                    #[cfg(target_os = "macos")]
                                     if reader_window {
                                         // The reader window's notes popover lists the highlights, like its contents.
                                         imago_window_macos::set_notes(
@@ -1669,6 +1679,34 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                     move || note_draft.get().is_some(),
                                                     move || {
                                                         let save = save_note_draft.clone();
+                                                        #[cfg(target_os = "macos")]
+                                                        let cancel_button = nsh_core::ui::prelude::native(page_view::NOTE_BUTTON)
+                                                            .w(px(92.0)).h(px(32.0))
+                                                            .prop("title", json!("Отмена"))
+                                                            .prop("action", json!("cancel"))
+                                                            .on_native_event(move |event: &NativeEvent| {
+                                                                if event.data.as_str() == Some("cancel") {
+                                                                    note_draft.set(None);
+                                                                }
+                                                            });
+                                                        #[cfg(not(target_os = "macos"))]
+                                                        let cancel_button = button()
+                                                            .on_press(move || note_draft.set(None))
+                                                            .child(text("Отмена"));
+                                                        #[cfg(target_os = "macos")]
+                                                        let save_button = nsh_core::ui::prelude::native(page_view::NOTE_BUTTON)
+                                                            .w(px(72.0)).h(px(32.0))
+                                                            .prop("title", json!("OK"))
+                                                            .prop("action", json!("save"))
+                                                            .on_native_event(move |event: &NativeEvent| {
+                                                                if event.data.as_str() == Some("save") {
+                                                                    save();
+                                                                }
+                                                            });
+                                                        #[cfg(not(target_os = "macos"))]
+                                                        let save_button = button()
+                                                            .on_press(move || save())
+                                                            .child(text("OK"));
                                                         view()
                                                             .absolute()
                                                             .inset_0()
@@ -1707,28 +1745,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                     .child(view().flex_1())
                                                                     .child(
                                                                         view().flex_row().justify_end().gap_2()
-                                                                            .child(
-                                                                                nsh_core::ui::prelude::native(page_view::NOTE_BUTTON)
-                                                                                    .w(px(92.0)).h(px(32.0))
-                                                                                    .prop("title", json!("Отмена"))
-                                                                                    .prop("action", json!("cancel"))
-                                                                                    .on_native_event(move |event: &NativeEvent| {
-                                                                                        if event.data.as_str() == Some("cancel") {
-                                                                                            note_draft.set(None);
-                                                                                        }
-                                                                                    }),
-                                                                            )
-                                                                            .child(
-                                                                                nsh_core::ui::prelude::native(page_view::NOTE_BUTTON)
-                                                                                    .w(px(72.0)).h(px(32.0))
-                                                                                    .prop("title", json!("OK"))
-                                                                                    .prop("action", json!("save"))
-                                                                                    .on_native_event(move |event: &NativeEvent| {
-                                                                                        if event.data.as_str() == Some("save") {
-                                                                                            save();
-                                                                                        }
-                                                                                    }),
-                                                                            ),
+                                                                            .child(cancel_button)
+                                                                            .child(save_button),
                                                                     ),
                                                             )
                                                     },

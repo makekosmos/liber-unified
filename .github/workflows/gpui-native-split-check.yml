@@ -35,5 +35,5 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libfontconfig-dev libglib2.0-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1
+          sudo apt-get install -y clang libcairo2-dev libfontconfig-dev libglib2.0-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1
       - run: cargo check --locked --bin gpui_native_split_spike --target "${{ matrix.target }}"
