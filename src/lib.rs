@@ -6,11 +6,11 @@ use liber_core::{
 pub mod sidebar;
 
 use nsh_base::{button, safe_area_view};
-use sidebar::{Page, native_sidebar};
 use nsh_core::color::rgb;
 use nsh_core::desktop::TitleBarStyle;
 use nsh_core::ui::desktop::{set_title_bar, title_bar};
 use nsh_core::ui::prelude::*;
+use sidebar::{Page, native_sidebar};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -38,10 +38,17 @@ const READER_PANEL_WIDTH: f32 = 300.0;
 const LIBRARY_BAR_HEIGHT: f32 = 64.0;
 const TITLE_CONTROLS_WIDTH: f32 = 116.0;
 const READER_BAR_HEIGHT: f32 = 48.0;
-/// Height of the native toolbar a reader window draws over its top edge.
-const READER_TOOLBAR: f32 = 52.0;
+/// Height of the tone that fades from the top of a reader window under its native toolbar.
+const READER_DIM_HEIGHT: f32 = 120.0;
+/// The share of that height that is solid tone before it starts to fade out.
+const READER_DIM_SOLID: f32 = 0.12;
 /// The tones the reader's settings popover offers, in its segment order.
-const READER_TONES: [PageTone; 4] = [PageTone::Day, PageTone::Sepia, PageTone::Gray, PageTone::Night];
+const READER_TONES: [PageTone; 4] = [
+    PageTone::Day,
+    PageTone::Sepia,
+    PageTone::Gray,
+    PageTone::Night,
+];
 const BOOK_CARD_WIDTH: f32 = 176.0;
 const BOOK_CARD_HEIGHT: f32 = 226.0;
 const SPACE_16: f32 = 16.0;
@@ -64,12 +71,34 @@ fn icon(path: &'static str, size: f32, dark: Signal<bool>) -> impl IntoElement {
 
 fn sidebar_frame(selected: Signal<Option<usize>>, open: Signal<bool>, dark: Signal<bool>) -> View {
     view()
-        .w(move || px(if sidebar::system() || (selected.get().is_some() && !open.get()) { 0.0 } else { SIDEBAR_WIDTH }))
+        .w(move || {
+            px(
+                if sidebar::system() || (selected.get().is_some() && !open.get()) {
+                    0.0
+                } else {
+                    SIDEBAR_WIDTH
+                },
+            )
+        })
         .min_w_0()
         .overflow_hidden()
         .flex_col()
-        .bg(move || rgb(if dark.get() { LIBER_SURFACE_DARK } else { LIBER_SIDEBAR }))
-        .p(move || px(if sidebar::system() || selected.get().is_some() || sidebar::native_registered() { 0.0 } else { SPACE_16 }))
+        .bg(move || {
+            rgb(if dark.get() {
+                LIBER_SURFACE_DARK
+            } else {
+                LIBER_SIDEBAR
+            })
+        })
+        .p(move || {
+            px(
+                if sidebar::system() || selected.get().is_some() || sidebar::native_registered() {
+                    0.0
+                } else {
+                    SPACE_16
+                },
+            )
+        })
         .gap_3()
 }
 
@@ -136,7 +165,9 @@ static READER_BOOK: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Opens `source` in a reader window titled `title`.
 pub fn open_reader_window(source: &str, title: &str) {
-    *READER_BOOK.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(PathBuf::from(source));
+    *READER_BOOK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(PathBuf::from(source));
     imago_window_macos::open_reader(title, source);
 }
 
@@ -153,6 +184,21 @@ pub fn open_startup_reader() {
     }
 }
 
+fn reader_tone_color(tone: PageTone, dark: bool) -> u32 {
+    match tone {
+        PageTone::Day => {
+            if dark {
+                LIBER_READER_DARK
+            } else {
+                LIBER_READER_LIGHT
+            }
+        }
+        PageTone::Sepia => 0xF4ECD8,
+        PageTone::Gray => 0x29292D,
+        PageTone::Night => 0x17171A,
+    }
+}
+
 fn window_app(reader_window: bool) -> impl IntoElement {
     let initial_tone = load_tone();
     let mut startup_books = load_books();
@@ -166,11 +212,19 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let mut startup_rendered = None;
     let mut startup_outline = Vec::new();
     let mut startup_size = (1, 1);
+    let mut startup_error = None;
     let reader_source = reader_window
-        .then(|| READER_BOOK.lock().unwrap_or_else(|poison| poison.into_inner()).clone())
+        .then(|| {
+            READER_BOOK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        })
         .flatten();
     if let Some(source) = reader_source {
-        if let Ok((book, first_page)) = import_pdf_with_first_page(&source) {
+        match import_pdf_with_first_page(&source) {
+            Err(error) => startup_error = Some(format!("Не удалось открыть книгу: {error}")),
+            Ok((book, first_page)) => {
             let source = book.path.clone();
             let at = startup_books
                 .iter()
@@ -198,8 +252,10 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                 startup_outline = data.toc;
                 startup_size = data.size;
             }
+            }
         }
     }
+    let reader_error = signal(startup_error);
     save_books(&startup_books);
     let books = signal(startup_books);
     let selected = signal(startup_selected);
@@ -455,13 +511,15 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                 let result = blocking(move || -> Result<_, String> {
                     let (book, first_page) = import_pdf_with_first_page(&source)?;
                     let rendered = if book.last_page == 0 && selected_tone == PageTone::Day {
-                        first_page.or_else(|| render(&book.path, 0, false).ok())
+                        first_page
+                            .or_else(|| render(&book.path, 0, false).ok())
                             .ok_or_else(|| "Не удалось отрисовать первую страницу".to_owned())?
                     } else {
                         render_with_tone(&book.path, book.last_page, 1.0, selected_tone)?
                     };
                     Ok((book, rendered))
-                }).await;
+                })
+                .await;
                 match result {
                     Ok(Ok((book, rendered))) => {
                         loading.set(false);
@@ -491,8 +549,14 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                         text_runs.set(rendered.text_runs);
                         error.set(String::new());
                     }
-                    Ok(Err(message)) => { loading.set(false); error.set(message); },
-                    Err(message) => { loading.set(false); error.set(format!("Не удалось открыть PDF: {message}")); },
+                    Ok(Err(message)) => {
+                        loading.set(false);
+                        error.set(message);
+                    }
+                    Err(message) => {
+                        loading.set(false);
+                        error.set(format!("Не удалось открыть PDF: {message}"));
+                    }
                 }
             });
         }
@@ -525,7 +589,13 @@ fn window_app(reader_window: bool) -> impl IntoElement {
             _ => {}
         })
     };
-    let sidebar_caption = move || format!("Книг: {} · v{}", books.get().len(), env!("CARGO_PKG_VERSION"));
+    let sidebar_caption = move || {
+        format!(
+            "Книг: {} · v{}",
+            books.get().len(),
+            env!("CARGO_PKG_VERSION")
+        )
+    };
     let sidebar_hidden = signal(false);
     if reader_window {
         // The contents popover's picks and the toolbar's requests reach the reader here, a few times a second.
@@ -534,13 +604,22 @@ fn window_app(reader_window: bool) -> impl IntoElement {
             let request_text = request_text_page.clone();
             move || {
                 for page in imago_window_macos::reader_presses() {
-                    reader_scroll_ref.scroll_to_index(page as u32, nsh_core::geometry::Percentage(0.0), px(0.0), true);
+                    reader_scroll_ref.scroll_to_index(
+                        page as u32,
+                        nsh_core::geometry::Percentage(0.0),
+                        px(0.0),
+                        true,
+                    );
                     open_page(page);
                 }
                 for command in imago_window_macos::reader_commands() {
                     match command {
                         imago_window_macos::ReaderCommand::Zoom(up) => {
-                            let next = if up { (zoom.get() + 0.25).min(3.0) } else { (zoom.get() - 0.25).max(0.5) };
+                            let next = if up {
+                                (zoom.get() + 0.25).min(3.0)
+                            } else {
+                                (zoom.get() - 0.25).max(0.5)
+                            };
                             if (next - zoom.get()).abs() > 0.001 {
                                 zoom.set(next);
                                 rendered_pages.set(vec![None; count.get()]);
@@ -564,10 +643,6 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                 request_text(page.get());
                             }
                         }
-                        imago_window_macos::ReaderCommand::Notes => {
-                            animate_layout(nsh_core::LayoutAnimation::EASE_IN_EASE_OUT);
-                            notes_sidebar_open.set(!notes_sidebar_open.get());
-                        }
                         imago_window_macos::ReaderCommand::Search(query) => {
                             document_query.set(query.clone());
                             let generation = search_generation.get().wrapping_add(1);
@@ -588,14 +663,20 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                         imago_window_macos::set_search_results(
                                             found
                                                 .iter()
-                                                .map(|hit| imago_window_macos::Contents { title: hit.excerpt.clone(), page: hit.page, depth: 0 })
+                                                .map(|hit| imago_window_macos::Contents {
+                                                    title: hit.excerpt.clone(),
+                                                    page: hit.page,
+                                                    depth: 0,
+                                                })
                                                 .collect(),
                                         );
                                         search_hits.set(found);
                                         error.set(String::new());
                                     }
                                     Ok(Err(message)) => error.set(message),
-                                    Err(message) => error.set(format!("Не удалось выполнить поиск: {message}")),
+                                    Err(message) => {
+                                        error.set(format!("Не удалось выполнить поиск: {message}"))
+                                    }
                                 }
                             });
                         }
@@ -603,10 +684,15 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                 }
                 imago_window_macos::set_reader_state(imago_window_macos::ReaderState {
                     zoom_percent: (zoom.get() * 100.0).round() as u32,
-                    tones: READER_TONES.iter().map(|tone| tone.label().to_owned()).collect(),
-                    tone: READER_TONES.iter().position(|candidate| *candidate == tone.get()).unwrap_or(0),
+                    tones: READER_TONES
+                        .iter()
+                        .map(|tone| tone.label().to_owned())
+                        .collect(),
+                    tone: READER_TONES
+                        .iter()
+                        .position(|candidate| *candidate == tone.get())
+                        .unwrap_or(0),
                     text_mode: text_mode.get(),
-                    notes_open: notes_sidebar_open.get(),
                 });
             }
         });
@@ -811,6 +897,19 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                             );
                         }
                                     let highlights = liber_core::notes::Notes::open(&liber_core::default_root(), &book.id).items;
+                                    if reader_window {
+                                        // The reader window's notes popover lists the highlights, like its contents.
+                                        imago_window_macos::set_notes(
+                                            highlights
+                                                .iter()
+                                                .map(|highlight| imago_window_macos::Contents {
+                                                    title: highlight.text.clone(),
+                                                    page: highlight.page as usize,
+                                                    depth: 0,
+                                                })
+                                                .collect(),
+                                        );
+                                    }
                                     let mut note_entries = view().flex_col().gap_2();
                                     if highlights.is_empty() {
                                         note_entries = note_entries.child(
@@ -1008,18 +1107,29 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                     notes_sidebar_open.set(!notes_sidebar_open.get());
                                                 }).child(icon(asset!("icons/inbox.svg").uri, 16.0, dark)))
             });
+                                    if let Some(message) = reader_error.get() {
+                                        return view()
+                                            .flex_1()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(text(message))
+                                            .into_element();
+                                    }
                                     return view()
                                         .flex_1()
                                         .flex_col()
-                                        .pt(px(if reader_window { READER_TOOLBAR } else { 0.0 }))
-                                        .bg(move || {
-                                            rgb(match tone.get() {
-                                                PageTone::Day => if dark.get() { LIBER_READER_DARK } else { LIBER_READER_LIGHT },
-                                                PageTone::Sepia => 0xE6DCC2,
-                                                PageTone::Gray => 0x29292D,
-                                                PageTone::Night => 0x17171A,
-                                            })
-                                        })
+                                        .bg(move || rgb(reader_tone_color(tone.get(), dark.get())))
+                                        .child(reader_window.then(|| view()
+                                            .absolute()
+                                            .top(px(0.0))
+                                            .w_full()
+                                            .z_index(1)
+                                            .h(px(READER_DIM_HEIGHT))
+                                            .bg_linear_to_b()
+                                            .gradient_from(move || rgb(reader_tone_color(tone.get(), dark.get())))
+                                            .gradient_via(move || rgb(reader_tone_color(tone.get(), dark.get())))
+                                            .gradient_via_position(Percentage(READER_DIM_SOLID))
+                                            .window_drag(true)))
                                         .child(view()
                                                 .h(move || px(if reader_window || sidebar::system() { 0.0 } else { READER_BAR_HEIGHT }))
                                                 .overflow_hidden()

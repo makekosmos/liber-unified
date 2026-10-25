@@ -623,25 +623,29 @@ fn apply_tone(pixmap: &mut mupdf::Pixmap, tone: PageTone) {
     for row in pixmap.samples_mut().chunks_mut(stride).take(height) {
         for pixel in row.chunks_mut(components).take(width) {
             let (r, g, b) = (pixel[0], pixel[1], pixel[2]);
+            let light = ((u16::from(r) * 77 + u16::from(g) * 150 + u16::from(b) * 29) / 256) as u8;
             let (r, g, b) = match tone {
                 PageTone::Day => (r, g, b),
-                PageTone::Sepia => (
-                    ((u16::from(r) * 0xF4) / 255) as u8,
-                    ((u16::from(g) * 0xEC) / 255) as u8,
-                    ((u16::from(b) * 0xD8) / 255) as u8,
-                ),
+                PageTone::Sepia => paper_tone(light, SEPIA_INK, SEPIA_PAPER),
                 PageTone::Gray => (lift(255 - r), lift(255 - g), lift(255 - b)),
-                PageTone::Night => (
-                    ((u16::from(255 - r) * 0xDD) / 255) as u8,
-                    ((u16::from(255 - g) * 0xDD) / 255) as u8,
-                    ((u16::from(255 - b) * 0xD6) / 255) as u8,
-                ),
+                PageTone::Night => paper_tone(light, NIGHT_INK, NIGHT_PAPER),
             };
             pixel[0] = r;
             pixel[1] = g;
             pixel[2] = b;
         }
     }
+}
+
+const SEPIA_INK: [u8; 3] = [0x3B, 0x2F, 0x24];
+const SEPIA_PAPER: [u8; 3] = [0xF4, 0xEC, 0xD8];
+const NIGHT_INK: [u8; 3] = [0xB4, 0xB4, 0xB8];
+const NIGHT_PAPER: [u8; 3] = [0x17, 0x17, 0x1A];
+
+/// Maps a pixel to ink on paper by its brightness: white stays paper, black becomes ink.
+fn paper_tone(light: u8, ink: [u8; 3], paper: [u8; 3]) -> (u8, u8, u8) {
+    let mix = |i: u8, p: u8| ((u16::from(i) * u16::from(255 - light) + u16::from(p) * u16::from(light)) / 255) as u8;
+    (mix(ink[0], paper[0]), mix(ink[1], paper[1]), mix(ink[2], paper[2]))
 }
 
 fn lift(value: u8) -> u8 {
