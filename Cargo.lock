@@ -2976,7 +2976,7 @@ dependencies = [
 [[package]]
 name = "gpui-pre"
 version = "0.3.9"
-source = "git+https://github.com/makekosmos/imago.git?branch=feat%2Fgpui-native-split#1c329498277794cbb048e06e30b6e7a9df82d7de"
+source = "git+https://github.com/makekosmos/imago.git?branch=feat%2Fgpui-native-split#aa9e3530d37cef3a8f4f36d7d176f010f2c801ee"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -3190,7 +3190,7 @@ dependencies = [
 [[package]]
 name = "gpui-pre-macos"
 version = "0.3.9"
-source = "git+https://github.com/makekosmos/imago.git?branch=feat%2Fgpui-native-split#1c329498277794cbb048e06e30b6e7a9df82d7de"
+source = "git+https://github.com/makekosmos/imago.git?branch=feat%2Fgpui-native-split#aa9e3530d37cef3a8f4f36d7d176f010f2c801ee"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -3859,7 +3859,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4045,7 +4045,7 @@ checksum = "65b27460c2c92b037f3f94c538ed9a3342f3fdf923606781629ccb35f82d042a"
 [[package]]
 name = "imago-gpui-native-split"
 version = "0.1.0"
-source = "git+https://github.com/makekosmos/imago.git?branch=feat%2Fgpui-native-split#1c329498277794cbb048e06e30b6e7a9df82d7de"
+source = "git+https://github.com/makekosmos/imago.git?branch=feat%2Fgpui-native-split#aa9e3530d37cef3a8f4f36d7d176f010f2c801ee"
 dependencies = [
  "block2 0.6.2",
  "imago-native-sidebar",
@@ -4058,7 +4058,7 @@ dependencies = [
 [[package]]
 name = "imago-native-sidebar"
 version = "0.1.0"
-source = "git+https://github.com/makekosmos/imago.git?branch=feat%2Fgpui-native-split#1c329498277794cbb048e06e30b6e7a9df82d7de"
+source = "git+https://github.com/makekosmos/imago.git?branch=feat%2Fgpui-native-split#aa9e3530d37cef3a8f4f36d7d176f010f2c801ee"
 dependencies = [
  "nsh-core",
  "nsh-platform-macos",
@@ -4069,7 +4069,7 @@ dependencies = [
 [[package]]
 name = "imago-window-macos"
 version = "0.1.0"
-source = "git+https://github.com/makekosmos/imago.git?branch=feat%2Fgpui-native-split#1c329498277794cbb048e06e30b6e7a9df82d7de"
+source = "git+https://github.com/makekosmos/imago.git?branch=feat%2Fgpui-native-split#aa9e3530d37cef3a8f4f36d7d176f010f2c801ee"
 dependencies = [
  "imago-native-sidebar",
  "nsh-core",
