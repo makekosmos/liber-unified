@@ -58,7 +58,10 @@ impl PageText {
     }
 
     pub fn link_at(&self, x: f32, y: f32) -> Option<&LinkTarget> {
-        self.links.iter().find(|l| inside(&l.r, x, y)).map(|l| &l.target)
+        self.links
+            .iter()
+            .find(|l| inside(&l.r, x, y))
+            .map(|l| &l.target)
     }
 
     /// One rectangle per line covering glyphs `a..=b` (order-insensitive).
@@ -148,7 +151,9 @@ pub struct Highlight {
 
 impl Highlight {
     pub fn contains(&self, x: f32, y: f32) -> bool {
-        self.rects.iter().any(|r| x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3])
+        self.rects
+            .iter()
+            .any(|r| x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3])
     }
 }
 
@@ -173,7 +178,8 @@ impl Notes {
 
     pub fn add(&mut self, h: Highlight) {
         self.items.push(h);
-        self.items.sort_by(|a, b| a.page.cmp(&b.page).then(a.created.cmp(&b.created)));
+        self.items
+            .sort_by(|a, b| a.page.cmp(&b.page).then(a.created.cmp(&b.created)));
         self.save();
     }
 
@@ -194,7 +200,9 @@ impl Notes {
     }
 
     fn save(&self) {
-        let Ok(json) = serde_json::to_vec_pretty(&self.items) else { return };
+        let Ok(json) = serde_json::to_vec_pretty(&self.items) else {
+            return;
+        };
         if let Some(dir) = self.path.parent() {
             if fs::create_dir_all(dir).is_err() {
                 return;
@@ -214,14 +222,21 @@ mod tests {
     fn line(text: &str, line: u32, y: f32) -> Vec<Ch> {
         text.chars()
             .enumerate()
-            .map(|(i, c)| Ch { c, r: [i as f32 * 10.0, y, i as f32 * 10.0 + 10.0, y + 10.0], line })
+            .map(|(i, c)| Ch {
+                c,
+                r: [i as f32 * 10.0, y, i as f32 * 10.0 + 10.0, y + 10.0],
+                line,
+            })
             .collect()
     }
 
     fn page() -> PageText {
         let mut chars = line("hello world", 0, 0.0);
         chars.extend(line("second", 1, 20.0));
-        PageText { chars, links: Vec::new() }
+        PageText {
+            chars,
+            links: Vec::new(),
+        }
     }
 
     #[test]

@@ -1751,9 +1751,14 @@ dependencies = [
  "liber-core",
  "nsh-base",
  "nsh-core",
+ "nsh-engine",
  "nsh-platform-linux",
  "nsh-platform-macos",
  "nsh-platform-windows",
+ "nsh-testing",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "rfd",
  "serde_json",
 ]
@@ -2129,6 +2134,19 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-numerics",
+]
+
+[[package]]
+name = "nsh-testing"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f7ad102cb51b63e4c9f1aed451c4545f9c8389eef6bfb7997df8454a2b1d17f"
+dependencies = [
+ "crossbeam-channel",
+ "log",
+ "nsh-core",
+ "nsh-engine",
+ "regex",
 ]
 
 [[package]]

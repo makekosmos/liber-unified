@@ -1,9 +1,13 @@
 //! Liber desktop app. The native UI and PDF reader share one application root.
 use liber_core::{
-    PageTone, extract_page_text, import_pdf_with_first_page, load_books, render, render_with_tone,
-    save_books, search_books, search_pdf, set_progress,
+    PageTone, READING_WIDTH_PT, extract_page_text, import_pdf_with_first_page, load_books, render,
+    render_with_tone, save_books, search_books, search_pdf, set_progress,
 };
+pub mod reader_pages;
+pub mod reader_window;
 pub mod sidebar;
+#[cfg(target_os = "macos")]
+pub mod page_view;
 
 use nsh_base::{button, safe_area_view};
 use nsh_core::color::rgb;
@@ -12,6 +16,7 @@ use nsh_core::ui::desktop::{set_title_bar, title_bar};
 use nsh_core::ui::prelude::*;
 use sidebar::{Page, native_sidebar};
 use std::path::PathBuf;
+use serde_json::{json, Value as JsonValue};
 use std::sync::Mutex;
 
 const LIBER_BG: u32 = 0xF5F5F7;
@@ -262,6 +267,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let section = signal(Page::Home);
     let path = signal(startup_path);
     let page = signal(startup_page);
+    let initial_page = startup_page;
     let count = signal(startup_count);
     let image_path = signal(startup_image);
     let extracted = signal(startup_text.clone());
@@ -274,7 +280,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
             *slot = Some(page);
         }
     }
-    let rendered_pages = signal(initial_pages);
+    let rendered_pages = signal(initial_pages.into_iter().map(signal).collect());
     let mut initial_reading_pages = vec![None; startup_count];
     if let Some(slot) = initial_reading_pages.get_mut(startup_page) {
         *slot = Some(startup_text.clone());
@@ -298,69 +304,25 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let notes_sidebar_open = signal(false);
 
     let pending_pages = signal(Vec::<usize>::new());
-    let visible_pages = signal((startup_page, startup_page));
-    let request_page = std::rc::Rc::new(move |at: usize| {
-        if at >= count.get() || pending_pages.get().contains(&at) {
-            return;
-        }
-        let requested_zoom = if at == page.get() { zoom.get() } else { 1.0 };
-        let requested_tone = tone.get();
-        if rendered_pages
-            .get()
-            .get(at)
-            .and_then(Option::as_ref)
-            .is_some_and(|cached| {
-                (cached.zoom - requested_zoom).abs() < 0.001 && cached.tone == requested_tone
-            })
-        {
-            return;
-        }
-        let mut pending = pending_pages.get();
-        pending.push(at);
-        pending_pages.set(pending);
-        let source = path.get();
-        let pages = rendered_pages;
-        let pending = pending_pages;
-        let count = count;
-        let current_path = path;
-        let visible = visible_pages;
-        let current_zoom = zoom;
-        let current_page = page;
-        let current_tone = tone;
-        spawn(async move {
-            let page_path = source.clone();
-            let result =
-                blocking(move || render_with_tone(page_path, at, requested_zoom, requested_tone))
-                    .await;
-            let mut pending_list = pending.get();
-            pending_list.retain(|index| *index != at);
-            pending.set(pending_list);
-            let expected_zoom = if at == current_page.get() {
-                current_zoom.get()
-            } else {
-                1.0
-            };
-            if current_path.get() != source
-                || (expected_zoom - requested_zoom).abs() > 0.001
-                || current_tone.get() != requested_tone
-            {
-                return;
-            }
-            if let Ok(Ok(rendered)) = result {
-                let (first, last) = visible.get();
-                if at < first.saturating_sub(2) || at > last.saturating_add(2) {
-                    return;
-                }
-                count.set(rendered.count);
-                let mut cached = pages.get();
-                if cached.len() < rendered.count {
-                    cached.resize(rendered.count, None);
-                }
-                cached[at] = Some(rendered);
-                pages.set(cached);
-            }
-        });
-    });
+    let reader_pages = reader_pages::ReaderPages {
+        rendered: rendered_pages,
+        pending: pending_pages,
+        path,
+        count,
+        zoom,
+        tone,
+        in_flight: Default::default(),
+        last_visible: Default::default(),
+        last_visible_change: std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now())),
+        render_preview: |path, at, zoom, tone, cancel| {
+            liber_core::render_preview_cancellable(path, at, zoom, tone, cancel)
+        },
+        render: |path, at, zoom, tone, cancel| liber_core::render_cancellable(path, at, zoom, tone, cancel),
+        owner: Owner::current(),
+    };
+    let pages_for_view = reader_pages.clone();
+    let request_page = std::rc::Rc::new(move |at: usize| reader_pages.request(at));
+    let text_owner = Owner::current();
     let request_text_page = std::rc::Rc::new(move |at: usize| {
         if at >= count.get()
             || reading_pages.get().get(at).is_some_and(Option::is_some)
@@ -375,7 +337,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
         let current_path = path;
         let pages = reading_pages;
         let pending = pending_text_pages;
-        spawn(async move {
+        text_owner.run(|| spawn(async move {
             let page_path = source.clone();
             let result = blocking(move || extract_page_text(page_path, at)).await;
             let mut loading = pending.get();
@@ -392,7 +354,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                 cache[at] = Some(text);
                 pages.set(cache);
             }
-        });
+        }));
     });
     let load_generation = signal(0u64);
     let preload_after_jump = request_page.clone();
@@ -430,7 +392,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                     count.set(result.count);
                     let mut cached = vec![None; result.count];
                     cached[at] = Some(result.clone());
-                    rendered_pages.set(cached);
+                    rendered_pages.set(cached.into_iter().map(signal).collect());
                     pending_pages.set(Vec::new());
                     image_path.set(result.png);
                     extracted.set(if result.text.is_empty() {
@@ -466,7 +428,6 @@ fn window_app(reader_window: bool) -> impl IntoElement {
     let load_first = load.clone();
     let load_prev = load.clone();
     let load_next = load.clone();
-    let request_visible = request_page.clone();
     let request_import = request_page.clone();
     if selected.get().is_some() {
         request_page(startup_page);
@@ -535,7 +496,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                         page.set(book.last_page);
                         let mut cache = vec![None; rendered.count];
                         cache[book.last_page] = Some(rendered.clone());
-                        rendered_pages.set(cache);
+                        rendered_pages.set(cache.into_iter().map(signal).collect());
                         let mut text_cache = vec![None; rendered.count];
                         text_cache[book.last_page] = Some(rendered.text.clone());
                         reading_pages.set(text_cache);
@@ -622,7 +583,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                             };
                             if (next - zoom.get()).abs() > 0.001 {
                                 zoom.set(next);
-                                rendered_pages.set(vec![None; count.get()]);
+                                rendered_pages.set((0..count.get()).map(|_| signal(None)).collect());
                                 pending_pages.set(Vec::new());
                                 open_page(page.get());
                             }
@@ -631,7 +592,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                             if let Some(next) = READER_TONES.get(index).copied() {
                                 tone.set(next);
                                 save_tone(next);
-                                rendered_pages.set(vec![None; count.get()]);
+                                rendered_pages.set((0..count.get()).map(|_| signal(None)).collect());
                                 pending_pages.set(Vec::new());
                                 open_page(page.get());
                             }
@@ -827,8 +788,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                 ),
                         ))
                         .child(dynamic(move || {
-                            let request_for_reader = request_visible.clone();
                             let request_text_for_reader = request_text_page.clone();
+                            let pages_for_reader = pages_for_view.clone();
                             if reader_window {
                                 // The reader window's contents popover lists the open book's contents.
                                 imago_window_macos::set_contents(
@@ -1014,7 +975,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                         let next = tone.get().next();
                                                         tone.set(next);
                                                         save_tone(next);
-                                                        rendered_pages.set(vec![None; count.get()]);
+                                                        rendered_pages.set((0..count.get()).map(|_| signal(None)).collect());
                                                         pending_pages.set(Vec::new());
                                                         reopen(page.get());
                                                     }
@@ -1025,7 +986,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                         let next = (zoom.get() - 0.25).max(0.5);
                                                         if (next - zoom.get()).abs() > 0.001 {
                                                             zoom.set(next);
-                                                            rendered_pages.set(vec![None; count.get()]);
+                                                            rendered_pages.set((0..count.get()).map(|_| signal(None)).collect());
                                                             pending_pages.set(Vec::new());
                                                             reopen(page.get());
                                                         }
@@ -1038,7 +999,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                         let next = (zoom.get() + 0.25).min(3.0);
                                                         if (next - zoom.get()).abs() > 0.001 {
                                                             zoom.set(next);
-                                                            rendered_pages.set(vec![None; count.get()]);
+                                                            rendered_pages.set((0..count.get()).map(|_| signal(None)).collect());
                                                             pending_pages.set(Vec::new());
                                                             reopen(page.get());
                                                         }
@@ -1143,8 +1104,9 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                 .child(dynamic(move || {
                                                     if text_mode.get() {
                                                         virtual_list(move || count.get(), move |position| {
-                                                            let index = position.index();
+                                                            let position = position;
                                                             dynamic(move || {
+                                                                let index = position.index();
                                                                 let body = reading_pages.get().get(index).cloned().flatten();
                                                                 let Some(body) = body else {
                                                                     return view().w_full().h(px(220.0)).items_center().justify_center()
@@ -1162,7 +1124,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                             })
                                                         })
                                                         .estimated_item_size(px(700.0))
-                                                        .initial_scroll_index(page.get())
+                                                        .initial_scroll_index(initial_page)
                                                         .on_viewable_items_change({
                                                             let request = request_text_for_reader.clone();
                                                             let current_page = page;
@@ -1181,9 +1143,10 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                         scroll().flex_1().horizontal().child(
                                                             view().w_full().min_w(px(680.0 * zoom.get())).flex_row().justify_center().child(
                                                         virtual_list(move || count.get(), move |position| {
-                                                            let index = position.index();
+                                                            let position = position;
                                                             dynamic(move || {
-                                                                let rendered = rendered_pages.get().get(index).cloned().flatten();
+                                                                let index = position.index();
+                                                                let rendered = rendered_pages.get().get(index).and_then(|slot| slot.get());
                                                                 let Some(rendered) = rendered else {
                                                                     let scale = zoom.get();
                                                                     return view().w(px(680.0 * scale)).h(px(980.0 * scale)).items_center().justify_center()
@@ -1191,8 +1154,8 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                 };
                                                                 let (width, height) = rendered.size;
                                                                 if width == 0 { return view().h(px(980.0)).into_element(); }
-                                                                // MuPDF text geometry uses page points while the bitmap is rendered at 1.25x.
-                                                                let display_width = 680.0 * zoom.get();
+                                                                // MuPDF text geometry uses page points; the tiles are rendered at device density for this width.
+                                                                let display_width = READING_WIDTH_PT * zoom.get();
                                                                 let scale = display_width / rendered.points.0;
                                                                 let image_height = display_width * height as f32 / width as f32;
                                                                 let mut selectable = view().absolute().inset_0();
@@ -1204,62 +1167,60 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                                         .text_size(px(font_size)).text_color(rgb(LIBER_INK).opacity(0.0))
                                                                         .selectable(true).selection_color(rgb(LIBER_ACCENT)));
                                                                 }
-                                                                let mut tiles = view().absolute().inset_0();
-                                                                for tile in rendered.tiles {
-                                                                    let tile_scale = scale / tile.scale;
-                                                                    tiles = tiles.child(view().absolute()
-                                                                        .left(px(tile.x as f32 * tile_scale))
-                                                                        .top(px(tile.y as f32 * tile_scale))
-                                                                        .w(px(tile.width as f32 * tile_scale))
-                                                                        .h(px(tile.height as f32 * tile_scale))
-                                                                        .child(image(tile.png).w_full().h_full()));
-                                                                }
-                                                                view().w_full().flex_row().justify_center().child(
-                                                                    view().relative().selection_area(true).w(px(display_width)).h(px(image_height))
-                                                                        .child(image(rendered.png).w(px(display_width)).h(px(image_height)))
-                                                                        .child(tiles).child(selectable)
-                                                                ).into_element()
+let body = view().relative().selection_area(true).w(px(display_width)).h(px(image_height));
+                                                                #[cfg(target_os = "macos")]
+                                                                let body = {
+                                                                    let tiles: Vec<JsonValue> = rendered
+                                                                        .tiles
+                                                                        .iter()
+                                                                        .map(|tile| {
+                                                                            json!({
+                                                                                "png": tile.png,
+                                                                                "x": tile.x as f32 / tile.scale,
+                                                                                "y": tile.y as f32 / tile.scale,
+                                                                                "width": tile.width as f32 / tile.scale,
+                                                                                "height": tile.height as f32 / tile.scale,
+                                                                            })
+                                                                        })
+                                                                        .collect();
+                                                                    body.child(
+                                                                        nsh_core::ui::prelude::native(page_view::NAME)
+                                                                            .absolute()
+                                                                            .inset_0()
+                                                                            .prop("preview", json!(rendered.png))
+                                                                            .prop("size", json!([rendered.points.0, rendered.points.1]))
+                                                                            .prop("tiles", JsonValue::Array(tiles)),
+                                                                    )
+                                                                };
+                                                                #[cfg(not(target_os = "macos"))]
+                                                                let body = {
+                                                                    let mut tiles = view().absolute().inset_0();
+                                                                    for tile in &rendered.tiles {
+                                                                        let tile_scale = scale / tile.scale;
+                                                                        tiles = tiles.child(view().absolute()
+                                                                            .left(px(tile.x as f32 * tile_scale))
+                                                                            .top(px(tile.y as f32 * tile_scale))
+                                                                            .w(px(tile.width as f32 * tile_scale))
+                                                                            .h(px(tile.height as f32 * tile_scale))
+                                                                            .child(image(tile.png.clone()).w_full().h_full()));
+                                                                    }
+                                                                    body.child(image(rendered.png.clone()).w(px(display_width)).h(px(image_height))).child(tiles)
+                                                                };
+                                                                view().w_full().flex_row().justify_center().child(body.child(selectable)).into_element()
                                                             })
                                                         })
                                                         .estimated_item_size(move || px(980.0 * zoom.get()))
                                                         .row_gap(px(SPACE_22))
                                                         .content_padding_y(px(SPACE_22))
-                                                        .initial_scroll_index(page.get())
+                                                        .initial_scroll_index(initial_page)
                                                         .element_ref(&reader_scroll_ref)
                                                         .on_viewable_items_change({
-                                                            let request = request_for_reader.clone();
-                                                            let pages = rendered_pages;
-                                                            let visible = visible_pages;
-                                                            let count = count;
+                                                            let pages = pages_for_reader.clone();
                                                             let current_page = page;
                                                             move |items: &ViewableItems| {
                                                                 if let Some((first, last)) = items.viewable {
-                                                                    let start = first.saturating_sub(1);
-                                                                    let end = last.saturating_add(1).min(count.get().saturating_sub(1));
-                                                                    visible.set((first, last));
                                                                     current_page.set(first);
-                                                                    let mut cache = pages.get();
-                                                                    let mut changed = false;
-                                                                    for (index, page) in cache.iter_mut().enumerate() {
-                                                                                if index != first {
-                                                                                    if let Some(page) = page {
-                                                                                        if !page.tiles.is_empty() {
-                                                                                            page.tiles.clear();
-                                                                                            changed = true;
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                        if (index < start || index > end) && page.is_some() {
-                                                                            *page = None;
-                                                                            changed = true;
-                                                                        }
-                                                                    }
-                                                                    if changed {
-                                                                        pages.set(cache);
-                                                                    }
-                                                                    for index in start..=end {
-                                                                        request(index);
-                                                                    }
+                                                                    pages.show(first, last);
                                                                 }
                                                             }
                                                         })
@@ -1408,7 +1369,7 @@ fn window_app(reader_window: bool) -> impl IntoElement {
                                                 .on_press(move || {
                                                     path.set(source.clone());
                                                     page_count_signal.set(page_count);
-                                                    pages_signal.set(vec![None; page_count]);
+                                                    pages_signal.set((0..page_count).map(|_| signal(None)).collect());
                                                     reading_signal.set(vec![None; page_count]);
                                                     pending_signal.set(Vec::new());
                                                     pending_text_signal.set(Vec::new());

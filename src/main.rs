@@ -21,6 +21,7 @@ fn main() -> impl std::process::Termination {
         liber::sidebar::system_rows(),
         || platform::Root::of::<liber::App>(),
         || platform::Root::of::<liber::ReaderApp>(),
+        liber::page_view::register,
     )
 }
 

@@ -8,20 +8,29 @@ use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
     },
 };
 
 const INDEX: &str = "library.json";
-const PAGE_CACHE_LIMIT: usize = 6;
+const PAGE_CACHE_LIMIT: usize = 16;
 const DOCUMENT_PAGE_LIMIT: usize = 16;
 const DISPLAY_LIST_CACHE_LIMIT: usize = 2;
 const MAX_RENDER_PIXELS: f64 = 12_000_000.0;
 const PREVIEW_RENDER_PIXELS: f64 = 1_000_000.0;
 const TILE_PIXELS: u32 = 510;
+const RECENT_PAGE_FILES: usize = 16;
+const RECENT_PREVIEW_FILES: usize = 48;
+/// Width of the reading column in points at zoom 1, as the UI lays it out.
+pub const READING_WIDTH_PT: f32 = 680.0;
+/// Device pixels per point on Retina displays; tiles are rendered at this density.
+const RETINA_SCALE: f64 = 2.0;
 type PageCacheKey = (String, usize, u64, u128, u32, u8);
 static PAGE_CACHE: OnceLock<Mutex<PageCache>> = OnceLock::new();
+static RECENT_PAGE_FILES_LIST: Mutex<VecDeque<Vec<PathBuf>>> = Mutex::new(VecDeque::new());
+static RECENT_PREVIEW_FILES_LIST: Mutex<VecDeque<PathBuf>> = Mutex::new(VecDeque::new());
 type DocumentCacheKey = (String, u64, u128);
 
 struct RenderRequest {
@@ -30,10 +39,13 @@ struct RenderRequest {
     zoom: f32,
     tone: PageTone,
     key: DocumentCacheKey,
+    cancel: Arc<AtomicBool>,
+    preview_only: bool,
     reply: SyncSender<Result<Page, String>>,
 }
 
 static PDF_RENDERER: OnceLock<Sender<RenderRequest>> = OnceLock::new();
+static PDF_PREVIEW_RENDERER: OnceLock<Sender<RenderRequest>> = OnceLock::new();
 
 #[derive(Default)]
 struct PageCache {
@@ -98,6 +110,8 @@ pub struct Page {
     pub zoom: f32,
     pub tiles: Vec<PageTile>,
     pub tone: PageTone,
+    /// False while the low-resolution image is visible and detail rendering continues.
+    pub complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +314,44 @@ pub fn render_with_tone(
     zoom: f32,
     tone: PageTone,
 ) -> Result<Page, String> {
+    render_cancellable(path, index, zoom, tone, &Arc::new(AtomicBool::new(false)))
+}
+
+/// Checks `cancel` before queued work and between rendering stages.
+/// An active MuPDF raster pass cannot be interrupted.
+pub fn render_cancellable(
+    path: impl AsRef<Path>,
+    index: usize,
+    zoom: f32,
+    tone: PageTone,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Page, String> {
+    render_cancellable_quality(path, index, zoom, tone, cancel, false)
+}
+
+/// Renders only the low-resolution page image so the reader can display it
+/// while detail tiles and selectable text are prepared on the detail worker.
+pub fn render_preview_cancellable(
+    path: impl AsRef<Path>,
+    index: usize,
+    zoom: f32,
+    tone: PageTone,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Page, String> {
+    render_cancellable_quality(path, index, zoom, tone, cancel, true)
+}
+
+fn render_cancellable_quality(
+    path: impl AsRef<Path>,
+    index: usize,
+    zoom: f32,
+    tone: PageTone,
+    cancel: &Arc<AtomicBool>,
+    preview_only: bool,
+) -> Result<Page, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("страница больше не нужна".into());
+    }
     let path = path.as_ref();
     let zoom = zoom.clamp(0.25, 4.0);
     let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
@@ -317,14 +369,26 @@ pub fn render_with_tone(
         .lock()
         .ok()
         .and_then(|mut cache| cache.get(&cache_key))
+        .filter(page_files_exist)
     {
-        return Ok(cached);
+        if !preview_only || cached.complete {
+            return Ok(cached);
+        }
     }
 
-    let renderer = PDF_RENDERER.get_or_init(|| {
+    let worker = if preview_only {
+        &PDF_PREVIEW_RENDERER
+    } else {
+        &PDF_RENDERER
+    };
+    let renderer = worker.get_or_init(|| {
         let (sender, receiver) = mpsc::channel();
         std::thread::Builder::new()
-            .name("liber-mupdf".into())
+            .name(if preview_only {
+                "liber-mupdf-preview".into()
+            } else {
+                "liber-mupdf-detail".into()
+            })
             .spawn(move || pdf_render_worker(receiver))
             .expect("failed to start MuPDF worker");
         sender
@@ -337,16 +401,67 @@ pub fn render_with_tone(
             zoom,
             tone,
             key: document_key,
+            cancel: Arc::clone(cancel),
+            preview_only,
             reply,
         })
         .map_err(|e| format!("MuPDF worker остановлен: {e}"))?;
     let rendered = result
         .recv()
         .map_err(|e| format!("MuPDF worker не вернул страницу: {e}"))??;
-    if let Ok(mut cache) = page_cache.lock() {
-        cache.insert(cache_key, rendered.clone());
+    if cancel.load(Ordering::Relaxed) {
+        return Err("страница больше не нужна".into());
+    }
+    if preview_only {
+        keep_recent_preview_file(&rendered.png);
+    } else {
+        if let Ok(mut cache) = page_cache.lock() {
+            cache.insert(cache_key, rendered.clone());
+        }
+        keep_recent_page_files(&rendered);
     }
     Ok(rendered)
+}
+
+fn page_files_exist(page: &Page) -> bool {
+    std::iter::once(&page.png)
+        .chain(page.tiles.iter().map(|tile| &tile.png))
+        .all(|path| Path::new(path).exists())
+}
+
+fn keep_recent_page_files(page: &Page) {
+    let files: Vec<PathBuf> = page.tiles.iter()
+        .map(|tile| &tile.png)
+        .map(PathBuf::from)
+        .collect();
+    let Ok(mut recent) = RECENT_PAGE_FILES_LIST.lock() else {
+        return;
+    };
+    recent.push_back(files);
+    while recent.len() > RECENT_PAGE_FILES {
+        let Some(evicted) = recent.pop_front() else {
+            break;
+        };
+        for path in evicted {
+            if !recent.iter().any(|kept| kept.contains(&path)) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn keep_recent_preview_file(path: &str) {
+    let Ok(mut recent) = RECENT_PREVIEW_FILES_LIST.lock() else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    recent.retain(|cached| cached != &path);
+    recent.push_back(path);
+    while recent.len() > RECENT_PREVIEW_FILES {
+        if let Some(evicted) = recent.pop_front() {
+            let _ = std::fs::remove_file(evicted);
+        }
+    }
 }
 
 fn pdf_render_worker(receiver: Receiver<RenderRequest>) {
@@ -363,6 +478,10 @@ fn pdf_render_worker(receiver: Receiver<RenderRequest>) {
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        if request.cancel.load(Ordering::Relaxed) {
+            let _ = request.reply.send(Err("страница больше не нужна".into()));
+            continue;
+        }
         if opened
             .as_ref()
             .is_none_or(|(key, _, _)| key != &request.key)
@@ -396,6 +515,8 @@ fn pdf_render_worker(receiver: Receiver<RenderRequest>) {
                 request.zoom,
                 request.tone,
                 &mut display_lists,
+                &request.cancel,
+                request.preview_only,
             ),
             None => Err("Документ PDF не открыт".into()),
         };
@@ -448,7 +569,12 @@ fn render_mupdf_page(
     zoom: f32,
     tone: PageTone,
     display_lists: &mut VecDeque<(usize, mupdf::DisplayList)>,
+    cancel: &AtomicBool,
+    preview_only: bool,
 ) -> Result<Page, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("страница больше не нужна".into());
+    }
     let count = document
         .page_count()
         .map_err(|e| format!("Не удалось получить количество страниц PDF: {e}"))?
@@ -456,7 +582,8 @@ fn render_mupdf_page(
     if index >= count || index > i32::MAX as usize {
         return Err("Страница не найдена".into());
     }
-    if !display_lists.iter().any(|(page, _)| *page == index) {
+    let needs_display_list = !display_lists.iter().any(|(page, _)| *page == index);
+    if needs_display_list {
         let page = document
             .load_page(index as i32)
             .map_err(|e| format!("Не удалось открыть страницу PDF: {e}"))?;
@@ -482,13 +609,18 @@ fn render_mupdf_page(
     let name = hash(identity.as_bytes());
     let area = f64::from(point_width * point_height).max(1.0);
     let preview_scale = (1.25f64).min((PREVIEW_RENDER_PIXELS / area).sqrt()) as f32;
-    let detail_scale = (1.25f64 * f64::from(zoom)).min((MAX_RENDER_PIXELS / area).sqrt()) as f32;
+    let fit_scale =
+        f64::from(READING_WIDTH_PT) * RETINA_SCALE * f64::from(zoom) / f64::from(point_width);
+    let detail_scale = fit_scale.min((MAX_RENDER_PIXELS / area).sqrt()) as f32;
     let zoom_key = (zoom * 100.0).round() as u32;
     let tone_key = tone as u8;
     let preview = std::env::temp_dir().join(format!(
-        "liber-mupdf-v4-{name}-{index}-t{tone_key}-preview.png"
+        "liber-mupdf-v5-{name}-{index}-t{tone_key}-preview.png"
     ));
     if image::image_dimensions(&preview).is_err() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("страница больше не нужна".into());
+        }
         let mut matrix = Matrix::new_scale(preview_scale, preview_scale);
         matrix.pre_translate(-bounds.x0, -bounds.y0);
         let mut pixmap = display_list
@@ -503,7 +635,23 @@ fn render_mupdf_page(
             .map_err(|e| format!("Не удалось сохранить страницу PDF: {e}"))?;
     }
     let size = image::image_dimensions(&preview).map_err(|e| e.to_string())?;
+    if preview_only {
+        return Ok(Page {
+            count,
+            png: preview.to_string_lossy().into_owned(),
+            text: String::new(),
+            text_runs: Vec::new(),
+            toc: toc.to_vec(),
+            size,
+            points: (point_width, point_height),
+            zoom,
+            tiles: Vec::new(),
+            tone,
+            complete: false,
+        });
+    }
     let mut tiles = Vec::new();
+    let mut detail_pixmap: Option<mupdf::Pixmap> = None;
     if detail_scale > preview_scale + 0.01 {
         let pixel_width = (point_width * detail_scale).ceil().max(1.0) as u32;
         let pixel_height = (point_height * detail_scale).ceil().max(1.0) as u32;
@@ -511,14 +659,52 @@ fn render_mupdf_page(
         matrix.pre_translate(-bounds.x0, -bounds.y0);
         for y in (0..pixel_height).step_by(TILE_PIXELS as usize) {
             for x in (0..pixel_width).step_by(TILE_PIXELS as usize) {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("страница больше не нужна".into());
+                }
                 let left = x.saturating_sub(1);
                 let top = y.saturating_sub(1);
                 let tile_width = (x + TILE_PIXELS + 1).min(pixel_width) - left;
                 let tile_height = (y + TILE_PIXELS + 1).min(pixel_height) - top;
                 let tile_path = std::env::temp_dir().join(format!(
-                    "liber-mupdf-v4-{name}-{index}-t{tone_key}-z{zoom_key}-{left}-{top}.png"
+                    "liber-mupdf-v5-{name}-{index}-t{tone_key}-z{zoom_key}-{left}-{top}.png"
                 ));
                 if image::image_dimensions(&tile_path).is_err() {
+                    if detail_pixmap.is_none() {
+                        let mut detail = mupdf::Pixmap::new(
+                            &Colorspace::device_rgb(),
+                            0,
+                            0,
+                            pixel_width as i32,
+                            pixel_height as i32,
+                            false,
+                        )
+                        .map_err(|e| format!("Не удалось создать изображение страницы PDF: {e}"))?;
+                        detail.clear_with(255).map_err(|e| e.to_string())?;
+                        {
+                            let device = mupdf::Device::from_pixmap(&detail).map_err(|e| {
+                                format!("Не удалось создать устройство рендера: {e}")
+                            })?;
+                            display_list
+                                .run(
+                                    &device,
+                                    &matrix,
+                                    mupdf::Rect::new(
+                                        0.0,
+                                        0.0,
+                                        pixel_width as f32,
+                                        pixel_height as f32,
+                                    ),
+                                )
+                                .map_err(|e| format!("Не удалось отрисовать страницу PDF: {e}"))?;
+                        }
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err("страница больше не нужна".into());
+                        }
+                        apply_tone(&mut detail, tone);
+                        detail_pixmap = Some(detail);
+                    }
+                    let detail = detail_pixmap.as_ref().unwrap();
                     let mut pixmap = mupdf::Pixmap::new(
                         &Colorspace::device_rgb(),
                         left as i32,
@@ -528,21 +714,23 @@ fn render_mupdf_page(
                         false,
                     )
                     .map_err(|e| format!("Не удалось создать тайл PDF: {e}"))?;
-                    pixmap.clear_with(255).map_err(|e| e.to_string())?;
-                    {
-                        let device = mupdf::Device::from_pixmap(&pixmap)
-                            .map_err(|e| format!("Не удалось создать устройство рендера: {e}"))?;
-                        let area = mupdf::Rect::new(
-                            left as f32,
-                            top as f32,
-                            (left + tile_width) as f32,
-                            (top + tile_height) as f32,
-                        );
-                        display_list
-                            .run(&device, &matrix, area)
-                            .map_err(|e| format!("Не удалось отрисовать тайл PDF: {e}"))?;
+                    let components = detail.n() as usize;
+                    if components != pixmap.n() as usize {
+                        return Err("Несовпадение цветовых компонентов тайла PDF".into());
                     }
-                    apply_tone(&mut pixmap, tone);
+                    let source_stride = detail.stride().max(0) as usize;
+                    let tile_stride = pixmap.stride().max(0) as usize;
+                    let row_bytes = tile_width as usize * components;
+                    let source_samples = detail.samples();
+                    let tile_samples = pixmap.samples_mut();
+                    for row in 0..tile_height as usize {
+                        let source_start =
+                            (top as usize + row) * source_stride + left as usize * components;
+                        let tile_start = row * tile_stride;
+                        tile_samples[tile_start..tile_start + row_bytes].copy_from_slice(
+                            &source_samples[source_start..source_start + row_bytes],
+                        );
+                    }
                     pixmap
                         .save_as(
                             tile_path
@@ -563,6 +751,7 @@ fn render_mupdf_page(
             }
         }
     }
+    drop(detail_pixmap);
     let text_page = display_list
         .to_text_page(TextPageFlags::empty())
         .map_err(|e| format!("Не удалось извлечь текст страницы PDF: {e}"))?;
@@ -606,6 +795,7 @@ fn render_mupdf_page(
         zoom,
         tiles,
         tone,
+        complete: true,
     })
 }
 
@@ -644,8 +834,14 @@ const NIGHT_PAPER: [u8; 3] = [0x17, 0x17, 0x1A];
 
 /// Maps a pixel to ink on paper by its brightness: white stays paper, black becomes ink.
 fn paper_tone(light: u8, ink: [u8; 3], paper: [u8; 3]) -> (u8, u8, u8) {
-    let mix = |i: u8, p: u8| ((u16::from(i) * u16::from(255 - light) + u16::from(p) * u16::from(light)) / 255) as u8;
-    (mix(ink[0], paper[0]), mix(ink[1], paper[1]), mix(ink[2], paper[2]))
+    let mix = |i: u8, p: u8| {
+        ((u16::from(i) * u16::from(255 - light) + u16::from(p) * u16::from(light)) / 255) as u8
+    };
+    (
+        mix(ink[0], paper[0]),
+        mix(ink[1], paper[1]),
+        mix(ink[2], paper[2]),
+    )
 }
 
 fn lift(value: u8) -> u8 {
@@ -750,7 +946,7 @@ fn find_excerpt(text: &str, needle: &[char]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Book, find_excerpt, search_books};
+    use super::{Book, PageTone, find_excerpt, render_cancellable, render_with_tone, search_books};
     #[test]
     fn progress_is_clamped_and_handles_single_page_documents() {
         let mut book = Book {
@@ -803,5 +999,157 @@ mod tests {
         assert!(excerpt.contains("Переменные"));
         assert!(find_excerpt("нет совпадения", &query).is_none());
         assert!(find_excerpt("любой текст", &[]).is_none());
+    }
+
+    /// Renders pages from several threads at once, the way the reader does
+    /// when it scrolls. Run with `LIBER_TEST_PDF=/path/book.pdf cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn concurrent_page_requests_all_finish() {
+        let path = std::env::var("LIBER_TEST_PDF").expect("set LIBER_TEST_PDF");
+        let pages: Vec<usize> = (6..=15).collect();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for index in pages.clone() {
+            let path = path.clone();
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let result = render_with_tone(&path, index, 1.0, PageTone::Day).map(|_| ());
+                let _ = sender.send((index, started.elapsed(), result));
+            });
+        }
+        drop(sender);
+        let mut finished = Vec::new();
+        while let Ok((index, elapsed, result)) =
+            receiver.recv_timeout(std::time::Duration::from_secs(120))
+        {
+            eprintln!("page {index}: {elapsed:?} {result:?}");
+            finished.push(index);
+        }
+        assert_eq!(
+            finished.len(),
+            pages.len(),
+            "pages that never finished: {:?}",
+            pages
+                .iter()
+                .filter(|i| !finished.contains(i))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Simulates scrolling down a document: each step requests a window of pages
+    /// around the viewport from separate threads, as the reader does. Every request
+    /// must finish. Run with `LIBER_TEST_PDF=/path/book.pdf cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn scrolling_requests_all_finish() {
+        let path = std::env::var("LIBER_TEST_PDF").expect("set LIBER_TEST_PDF");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut requested = std::collections::BTreeSet::new();
+        for first in 0..24usize {
+            for index in first.saturating_sub(1)..=first + 2 {
+                if !requested.insert(index) {
+                    continue;
+                }
+                let path = path.clone();
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    let started = std::time::Instant::now();
+                    let result = render_with_tone(&path, index, 1.0, PageTone::Day).map(|_| ());
+                    let _ = sender.send((index, started.elapsed(), result));
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        drop(sender);
+        let mut finished = std::collections::BTreeSet::new();
+        while let Ok((index, elapsed, result)) =
+            receiver.recv_timeout(std::time::Duration::from_secs(60))
+        {
+            eprintln!("page {index}: {elapsed:?} {result:?}");
+            finished.insert(index);
+        }
+        let stuck: Vec<usize> = requested.difference(&finished).copied().collect();
+        assert!(stuck.is_empty(), "pages that never finished: {stuck:?}");
+    }
+
+    /// Replays the reader's scroll: a step every 300 ms, each requesting the window around
+    /// the top page. Returns how long the final window took to render after the last step,
+    /// or `None` when it did not finish within the deadline.
+    fn replay_scroll(path: &str, cancel_offscreen: bool) -> Option<std::time::Duration> {
+        use std::collections::{BTreeSet, HashMap};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        type Live = HashMap<usize, (u64, Arc<AtomicBool>)>;
+        fn record(done: &mut BTreeSet<usize>, live: &mut Live, index: usize, job: u64, ok: bool) {
+            if ok {
+                done.insert(index);
+            }
+            if live.get(&index).is_some_and(|(current, _)| *current == job) {
+                live.remove(&index);
+            }
+        }
+
+        let (sender, receiver) = mpsc::channel::<(usize, u64, bool)>();
+        let mut live: Live = HashMap::new();
+        let mut done = BTreeSet::new();
+        let mut next_job = 0u64;
+        let mut final_window = 0..=0;
+        for first in 0..24usize {
+            let window = first.saturating_sub(1)..=first + 2;
+            if cancel_offscreen {
+                live.retain(|index, (_, cancel)| {
+                    let keep = window.contains(index);
+                    if !keep {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    keep
+                });
+            }
+            for index in window.clone() {
+                if done.contains(&index) || live.contains_key(&index) {
+                    continue;
+                }
+                next_job += 1;
+                let cancel = Arc::new(AtomicBool::new(false));
+                live.insert(index, (next_job, cancel.clone()));
+                let (path, sender, job) = (path.to_owned(), sender.clone(), next_job);
+                std::thread::spawn(move || {
+                    let ok = render_cancellable(&path, index, 1.0, PageTone::Day, &cancel).is_ok();
+                    let _ = sender.send((index, job, ok));
+                });
+            }
+            while let Ok((index, job, ok)) = receiver.try_recv() {
+                record(&mut done, &mut live, index, job, ok);
+            }
+            final_window = window;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(120);
+        while !final_window.clone().all(|index| done.contains(&index)) {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            if let Ok((index, job, ok)) = receiver.recv_timeout(Duration::from_millis(200)) {
+                record(&mut done, &mut live, index, job, ok);
+            }
+        }
+        Some(started.elapsed())
+    }
+
+    #[test]
+    #[ignore = "needs LIBER_TEST_PDF; renders a 24-step scroll through MuPDF"]
+    fn scroll_renders_the_final_window_promptly() {
+        let path = std::env::var("LIBER_TEST_PDF").expect("set LIBER_TEST_PDF");
+        let waited = replay_scroll(&path, true);
+        eprintln!("final window rendered after {waited:?}");
+        assert!(
+            waited.is_some_and(|waited| waited < std::time::Duration::from_secs(25)),
+            "final window took {waited:?}"
+        );
     }
 }

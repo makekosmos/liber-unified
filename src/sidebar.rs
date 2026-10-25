@@ -42,10 +42,12 @@ pub fn native_sidebar(
 ) -> NativeView {
     imago_native_sidebar::native_sidebar(SidebarSpec {
         items: Rc::new(move || items(dark.get())),
-        footer: vec![Row { id: "import", label: "Добавить PDF".into(), symbol: Some("plus") }],
-        selected: Rc::new(move || {
-            (selected.get().is_none()).then(|| page.get().id())
-        }),
+        footer: vec![Row {
+            id: "import",
+            label: "Добавить PDF".into(),
+            symbol: Some("plus"),
+        }],
+        selected: Rc::new(move || (selected.get().is_none()).then(|| page.get().id())),
         caption: Rc::new(caption),
         dark: Rc::new(move || dark.get()),
         press,
@@ -54,12 +56,29 @@ pub fn native_sidebar(
 
 fn items(dark: bool) -> Vec<Row> {
     vec![
-        Row { id: "home", label: "Главная".into(), symbol: Some("house") },
-        Row { id: "all", label: "Все книги".into(), symbol: Some("books.vertical") },
-        Row { id: "settings", label: "Настройки".into(), symbol: Some("gearshape") },
+        Row {
+            id: "home",
+            label: "Главная".into(),
+            symbol: Some("house"),
+        },
+        Row {
+            id: "all",
+            label: "Все книги".into(),
+            symbol: Some("books.vertical"),
+        },
+        Row {
+            id: "settings",
+            label: "Настройки".into(),
+            symbol: Some("gearshape"),
+        },
         Row {
             id: "theme",
-            label: if dark { "Светлая тема" } else { "Тёмная тема" }.into(),
+            label: if dark {
+                "Светлая тема"
+            } else {
+                "Тёмная тема"
+            }
+            .into(),
             symbol: Some(if dark { "sun.max" } else { "moon" }),
         },
     ]
@@ -79,10 +98,26 @@ pub fn system() -> bool {
 #[cfg(target_os = "macos")]
 pub fn system_rows() -> Vec<Row> {
     vec![
-        Row { id: "home", label: "Главная".into(), symbol: Some("house") },
-        Row { id: "all", label: "Все книги".into(), symbol: Some("books.vertical") },
-        Row { id: "settings", label: "Настройки".into(), symbol: Some("gearshape") },
-        Row { id: "import", label: "Добавить PDF".into(), symbol: Some("plus") },
+        Row {
+            id: "home",
+            label: "Главная".into(),
+            symbol: Some("house"),
+        },
+        Row {
+            id: "all",
+            label: "Все книги".into(),
+            symbol: Some("books.vertical"),
+        },
+        Row {
+            id: "settings",
+            label: "Настройки".into(),
+            symbol: Some("gearshape"),
+        },
+        Row {
+            id: "import",
+            label: "Добавить PDF".into(),
+            symbol: Some("plus"),
+        },
     ]
 }
 
