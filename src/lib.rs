@@ -3,12 +3,16 @@ use liber_core::{
     PageTone, extract_page_text, import_pdf_with_first_page, load_books, render, render_with_tone,
     save_books, search_books, search_pdf, set_progress,
 };
+pub mod sidebar;
+
 use nsh_base::{button, safe_area_view};
+use sidebar::{Page, native_sidebar};
 use nsh_core::color::rgb;
 use nsh_core::desktop::TitleBarStyle;
 use nsh_core::ui::desktop::{set_title_bar, title_bar};
 use nsh_core::ui::prelude::*;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 const LIBER_BG: u32 = 0xF5F5F7;
 const LIBER_SIDEBAR: u32 = 0xEBEBED;
@@ -32,7 +36,12 @@ const LIBER_ERROR_DARK: u32 = 0xFF6961;
 const SIDEBAR_WIDTH: f32 = 232.0;
 const READER_PANEL_WIDTH: f32 = 300.0;
 const LIBRARY_BAR_HEIGHT: f32 = 64.0;
+const TITLE_CONTROLS_WIDTH: f32 = 116.0;
 const READER_BAR_HEIGHT: f32 = 48.0;
+/// Height of the native toolbar a reader window draws over its top edge.
+const READER_TOOLBAR: f32 = 52.0;
+/// The tones the reader's settings popover offers, in its segment order.
+const READER_TONES: [PageTone; 4] = [PageTone::Day, PageTone::Sepia, PageTone::Gray, PageTone::Night];
 const BOOK_CARD_WIDTH: f32 = 176.0;
 const BOOK_CARD_HEIGHT: f32 = 226.0;
 const SPACE_16: f32 = 16.0;
@@ -51,6 +60,17 @@ fn icon(path: &'static str, size: f32, dark: Signal<bool>) -> impl IntoElement {
             LIBER_INK
         })
     })
+}
+
+fn sidebar_frame(selected: Signal<Option<usize>>, open: Signal<bool>, dark: Signal<bool>) -> View {
+    view()
+        .w(move || px(if sidebar::system() || (selected.get().is_some() && !open.get()) { 0.0 } else { SIDEBAR_WIDTH }))
+        .min_w_0()
+        .overflow_hidden()
+        .flex_col()
+        .bg(move || rgb(if dark.get() { LIBER_SURFACE_DARK } else { LIBER_SIDEBAR }))
+        .p(move || px(if sidebar::system() || selected.get().is_some() || sidebar::native_registered() { 0.0 } else { SPACE_16 }))
+        .gap_3()
 }
 
 fn appearance_path() -> PathBuf {
@@ -99,8 +119,41 @@ fn native(registry: &mut Registry) {
     registry.register::<App>();
 }
 
+/// The library window's app.
 #[component]
 pub fn App() -> impl IntoElement {
+    window_app(false)
+}
+
+/// The app of a reader window: the book in [`READER_BOOK`] and nothing else.
+#[component]
+pub fn ReaderApp() -> impl IntoElement {
+    window_app(true)
+}
+
+/// The book a reader window shows, set before the window opens.
+static READER_BOOK: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Opens `source` in a reader window titled `title`.
+pub fn open_reader_window(source: &str, title: &str) {
+    *READER_BOOK.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(PathBuf::from(source));
+    imago_window_macos::open_reader(title, source);
+}
+
+/// Opens the book named by `LIBER_OPEN_PDF`, imported if it is new, in a reader window.
+pub fn open_startup_reader() {
+    let Some(source) = std::env::var_os("LIBER_OPEN_PDF").map(PathBuf::from) else {
+        return;
+    };
+    match import_pdf_with_first_page(&source) {
+        Ok((book, _)) => {
+            open_reader_window(&book.path, &book.title);
+        }
+        Err(error) => eprintln!("Liber: could not open {}: {error}", source.display()),
+    }
+}
+
+fn window_app(reader_window: bool) -> impl IntoElement {
     let initial_tone = load_tone();
     let mut startup_books = load_books();
     let mut startup_selected = None;
@@ -113,7 +166,10 @@ pub fn App() -> impl IntoElement {
     let mut startup_rendered = None;
     let mut startup_outline = Vec::new();
     let mut startup_size = (1, 1);
-    if let Some(source) = std::env::var_os("LIBER_OPEN_PDF").map(PathBuf::from) {
+    let reader_source = reader_window
+        .then(|| READER_BOOK.lock().unwrap_or_else(|poison| poison.into_inner()).clone())
+        .flatten();
+    if let Some(source) = reader_source {
         if let Ok((book, first_page)) = import_pdf_with_first_page(&source) {
             let source = book.path.clone();
             let at = startup_books
@@ -147,6 +203,7 @@ pub fn App() -> impl IntoElement {
     save_books(&startup_books);
     let books = signal(startup_books);
     let selected = signal(startup_selected);
+    let section = signal(Page::Home);
     let path = signal(startup_path);
     let page = signal(startup_page);
     let count = signal(startup_count);
@@ -175,12 +232,14 @@ pub fn App() -> impl IntoElement {
     let search_generation = signal(0u64);
     let text_mode = signal(false);
     let zoom = signal(1.0f32);
+    // Shown while the pointer is on the reader window's top edge.
     let tone = signal(initial_tone);
     let dark = signal(load_dark());
     let loading = signal(false);
     let reader_scroll_ref = element_ref();
     let library_sidebar_open = signal(false);
     let outline_sidebar_open = signal(true);
+    let notes_sidebar_open = signal(false);
 
     let pending_pages = signal(Vec::<usize>::new());
     let visible_pages = signal((startup_page, startup_page));
@@ -365,11 +424,211 @@ pub fn App() -> impl IntoElement {
         })
     };
 
-    set_title_bar(TitleBarStyle::Hidden, Some(px(40.0)));
+    if !sidebar::system() {
+        set_title_bar(TitleBarStyle::Hidden, Some(px(40.0)));
+    }
+    let import_pdf = std::rc::Rc::new(move || {
+        if let Some(file) = rfd::FileDialog::new()
+            .add_filter("PDF", &["pdf"])
+            .pick_file()
+        {
+            let source = file.to_path_buf();
+            loading.set(true);
+            load_generation.set(load_generation.get().wrapping_add(1));
+            let selected_tone = tone.get();
+            let books = books;
+            let path = path;
+            let count = count;
+            let page = page;
+            let image_path = image_path;
+            let image_size = image_size;
+            let extracted = extracted;
+            let outline = outline;
+            let text_runs = text_runs;
+            let rendered_pages = rendered_pages;
+            let reading_pages = reading_pages;
+            let pending_pages = pending_pages;
+            let pending_text_pages = pending_text_pages;
+            let request_import = request_import.clone();
+            let error = error;
+            spawn(async move {
+                let result = blocking(move || -> Result<_, String> {
+                    let (book, first_page) = import_pdf_with_first_page(&source)?;
+                    let rendered = if book.last_page == 0 && selected_tone == PageTone::Day {
+                        first_page.or_else(|| render(&book.path, 0, false).ok())
+                            .ok_or_else(|| "Не удалось отрисовать первую страницу".to_owned())?
+                    } else {
+                        render_with_tone(&book.path, book.last_page, 1.0, selected_tone)?
+                    };
+                    Ok((book, rendered))
+                }).await;
+                match result {
+                    Ok(Ok((book, rendered))) => {
+                        loading.set(false);
+                        let mut list = books.get();
+                        if !list.iter().any(|b| b.path == book.path) {
+                            list.push(book.clone());
+                        }
+                        save_books(&list);
+                        books.set(list);
+                        open_reader_window(&book.path, &book.title);
+                        path.set(book.path);
+                        count.set(rendered.count);
+                        page.set(book.last_page);
+                        let mut cache = vec![None; rendered.count];
+                        cache[book.last_page] = Some(rendered.clone());
+                        rendered_pages.set(cache);
+                        let mut text_cache = vec![None; rendered.count];
+                        text_cache[book.last_page] = Some(rendered.text.clone());
+                        reading_pages.set(text_cache);
+                        pending_pages.set(Vec::new());
+                        pending_text_pages.set(Vec::new());
+                        request_import(book.last_page);
+                        image_path.set(rendered.png.clone());
+                        image_size.set(rendered.size);
+                        extracted.set(rendered.text);
+                        outline.set(rendered.toc);
+                        text_runs.set(rendered.text_runs);
+                        error.set(String::new());
+                    }
+                    Ok(Err(message)) => { loading.set(false); error.set(message); },
+                    Err(message) => { loading.set(false); error.set(format!("Не удалось открыть PDF: {message}")); },
+                }
+            });
+        }
+    });
+    let sidebar_press: std::rc::Rc<dyn Fn(&str)> = {
+        let import_pdf = import_pdf.clone();
+        let reload = load.clone();
+        std::rc::Rc::new(move |id: &str| match id {
+            "home" => {
+                selected.set(None);
+                section.set(Page::Home);
+            }
+            "all" => {
+                selected.set(None);
+                section.set(Page::All);
+            }
+            "settings" => {
+                selected.set(None);
+                section.set(Page::Settings);
+            }
+            "theme" => {
+                let next = !dark.get();
+                dark.set(next);
+                save_dark(next);
+                if count.get() > 0 {
+                    reload(page.get());
+                }
+            }
+            "import" => import_pdf(),
+            _ => {}
+        })
+    };
+    let sidebar_caption = move || format!("Книг: {} · v{}", books.get().len(), env!("CARGO_PKG_VERSION"));
+    let sidebar_hidden = signal(false);
+    if reader_window {
+        // The contents popover's picks and the toolbar's requests reach the reader here, a few times a second.
+        nsh_core::ui::ambient::set_interval(std::time::Duration::from_millis(30), {
+            let open_page = load_first.clone();
+            let request_text = request_text_page.clone();
+            move || {
+                for page in imago_window_macos::reader_presses() {
+                    reader_scroll_ref.scroll_to_index(page as u32, nsh_core::geometry::Percentage(0.0), px(0.0), true);
+                    open_page(page);
+                }
+                for command in imago_window_macos::reader_commands() {
+                    match command {
+                        imago_window_macos::ReaderCommand::Zoom(up) => {
+                            let next = if up { (zoom.get() + 0.25).min(3.0) } else { (zoom.get() - 0.25).max(0.5) };
+                            if (next - zoom.get()).abs() > 0.001 {
+                                zoom.set(next);
+                                rendered_pages.set(vec![None; count.get()]);
+                                pending_pages.set(Vec::new());
+                                open_page(page.get());
+                            }
+                        }
+                        imago_window_macos::ReaderCommand::Tone(index) => {
+                            if let Some(next) = READER_TONES.get(index).copied() {
+                                tone.set(next);
+                                save_tone(next);
+                                rendered_pages.set(vec![None; count.get()]);
+                                pending_pages.set(Vec::new());
+                                open_page(page.get());
+                            }
+                        }
+                        imago_window_macos::ReaderCommand::TextMode => {
+                            let enabled = !text_mode.get();
+                            text_mode.set(enabled);
+                            if enabled {
+                                request_text(page.get());
+                            }
+                        }
+                        imago_window_macos::ReaderCommand::Notes => {
+                            animate_layout(nsh_core::LayoutAnimation::EASE_IN_EASE_OUT);
+                            notes_sidebar_open.set(!notes_sidebar_open.get());
+                        }
+                        imago_window_macos::ReaderCommand::Search(query) => {
+                            document_query.set(query.clone());
+                            let generation = search_generation.get().wrapping_add(1);
+                            search_generation.set(generation);
+                            if query.is_empty() {
+                                search_hits.set(Vec::new());
+                                imago_window_macos::set_search_results(Vec::new());
+                                continue;
+                            }
+                            let source = path.get();
+                            spawn(async move {
+                                let result = blocking(move || search_pdf(source, &query)).await;
+                                if search_generation.get() != generation {
+                                    return;
+                                }
+                                match result {
+                                    Ok(Ok(found)) => {
+                                        imago_window_macos::set_search_results(
+                                            found
+                                                .iter()
+                                                .map(|hit| imago_window_macos::Contents { title: hit.excerpt.clone(), page: hit.page, depth: 0 })
+                                                .collect(),
+                                        );
+                                        search_hits.set(found);
+                                        error.set(String::new());
+                                    }
+                                    Ok(Err(message)) => error.set(message),
+                                    Err(message) => error.set(format!("Не удалось выполнить поиск: {message}")),
+                                }
+                            });
+                        }
+                    }
+                }
+                imago_window_macos::set_reader_state(imago_window_macos::ReaderState {
+                    zoom_percent: (zoom.get() * 100.0).round() as u32,
+                    tones: READER_TONES.iter().map(|tone| tone.label().to_owned()).collect(),
+                    tone: READER_TONES.iter().position(|candidate| *candidate == tone.get()).unwrap_or(0),
+                    text_mode: text_mode.get(),
+                    notes_open: notes_sidebar_open.get(),
+                });
+            }
+        });
+    } else if sidebar::system() {
+        // The system sidebar's picks and visibility reach the app here, a few times a second.
+        nsh_core::ui::ambient::set_interval(std::time::Duration::from_millis(30), {
+            let press = sidebar_press.clone();
+            move || {
+                for id in imago_window_macos::sidebar_presses() {
+                    press(&id);
+                }
+                let hidden = imago_window_macos::sidebar_collapsed();
+                if sidebar_hidden.get() != hidden {
+                    sidebar_hidden.set(hidden);
+                }
+            }
+        });
+    }
     view().flex_1().font_family(asset!("fonts/Inter.ttf").family).bg(bg).text_color(fg).child(
         safe_area_view().flex_1().child(
             view().flex_1().flex_col().bg(bg)
-                .child(view().h(px(40.0)).flex_none().flex_row().items_center()
+                .child(view().h(move || px(if sidebar::system() { 0.0 } else { 40.0 })).overflow_hidden().flex_none().flex_row().items_center()
                     .window_drag(true)
                     .pl(move || title_bar().left + px(12.0))
                     .pr(move || title_bar().right + px(12.0))
@@ -386,144 +645,61 @@ pub fn App() -> impl IntoElement {
                 .flex_1()
                 .flex_row()
                 .bg(bg)
-                .child(
-                    view()
-                        .w(move || px(if selected.get().is_some() && !library_sidebar_open.get() { 0.0 } else { SIDEBAR_WIDTH }))
-                        .min_w_0()
-                        .overflow_hidden()
-                        .flex_col()
-                        .bg(move || rgb(if dark.get() { LIBER_SURFACE_DARK } else { LIBER_SIDEBAR }))
-                        .p(move || px(if selected.get().is_some() { 0.0 } else { SPACE_16 }))
-                        .gap_3()
-                        .child(
-                            text("Liber")
-                                .text_size(px(24.0))
-                                .font_weight(FontWeight::BOLD),
-                        )
-                        .child(
-                            text("БИБЛИОТЕКА").text_size(px(11.0)).text_color(move || {
-                                rgb(if dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })
-                            }),
-                        )
-                        .child(
-                            button()
-                                .on_press(move || {
-                                    selected.set(None);
-                                })
-                                .child(view().flex_row().items_center().gap_2().child(icon(asset!("icons/book-open.svg").uri, 16.0, dark)).child(text("Главная"))),
-                        )
-                        .child(
-                            button()
-                                .on_press({
-                                    let reload = load.clone();
-                                    move || {
-                                        let next = !dark.get();
-                                        dark.set(next);
-                                        save_dark(next);
-                                        if count.get() > 0 {
-                                            reload(page.get());
+                .child((!reader_window).then(|| {
+                    let frame = sidebar_frame(selected, library_sidebar_open, dark);
+                    if sidebar::native_registered() {
+                        frame.child(native_sidebar(dark, section, selected, sidebar_caption, sidebar_press.clone()))
+                    } else {
+                        frame
+                            .child(
+                                button()
+                                .on_press({ let press = sidebar_press.clone(); move || press("home") })
+                                    .child(view().flex_row().items_center().gap_2().child(icon(asset!("icons/book-open.svg").uri, 16.0, dark)).child(text("Главная"))),
+                            )
+                            .child(
+                                button()
+                                .on_press({ let press = sidebar_press.clone(); move || press("all") })
+                                    .child(view().flex_row().items_center().gap_2().child(icon(asset!("icons/book-open.svg").uri, 16.0, dark)).child(text("Все книги"))),
+                            )
+                            .child(
+                                button()
+                                .on_press({ let press = sidebar_press.clone(); move || press("settings") })
+                                    .child(view().flex_row().items_center().gap_2().child(icon(asset!("icons/settings.svg").uri, 16.0, dark)).child(text("Настройки"))),
+                            )
+                            .child(
+                                button()
+                                .on_press({ let press = sidebar_press.clone(); move || press("theme") })
+                                    .child(view().flex_row().items_center().gap_2()
+                                        .child(icon(asset!("icons/settings.svg").uri, 16.0, dark))
+                                        .child(text(move || {
+                                        if dark.get() {
+                                            "Светлая тема"
+                                        } else {
+                                            "Тёмная тема"
                                         }
-                                    }
-                                })
-                                .child(view().flex_row().items_center().gap_2()
-                                    .child(icon(asset!("icons/settings.svg").uri, 16.0, dark))
-                                    .child(text(move || {
-                                    if dark.get() {
-                                        "Светлая тема"
-                                    } else {
-                                        "Тёмная тема"
-                                    }
-                                }))),
-                        )
-                                        .child(view().flex_1())
-                        .child(
-                            button()
-                                .on_press(move || {
-                                    if let Some(file) = rfd::FileDialog::new()
-                                        .add_filter("PDF", &["pdf"])
-                                        .pick_file()
-                                    {
-                                        let source = file.to_path_buf();
-                                        loading.set(true);
-                                        load_generation.set(load_generation.get().wrapping_add(1));
-                                        let selected_tone = tone.get();
-                                        let books = books;
-                                        let selected = selected;
-                                        let path = path;
-                                        let count = count;
-                                        let page = page;
-                                        let image_path = image_path;
-                                        let image_size = image_size;
-                                        let extracted = extracted;
-                                        let outline = outline;
-                                        let text_runs = text_runs;
-                                        let rendered_pages = rendered_pages;
-                                        let reading_pages = reading_pages;
-                                        let pending_pages = pending_pages;
-                                        let pending_text_pages = pending_text_pages;
-                                        let request_import = request_import.clone();
-                                        let error = error;
-                                        spawn(async move {
-                                            let result = blocking(move || -> Result<_, String> {
-                                                let (book, first_page) = import_pdf_with_first_page(&source)?;
-                                                let rendered = if book.last_page == 0 && selected_tone == PageTone::Day {
-                                                    first_page.or_else(|| render(&book.path, 0, false).ok())
-                                                        .ok_or_else(|| "Не удалось отрисовать первую страницу".to_owned())?
-                                                } else {
-                                                    render_with_tone(&book.path, book.last_page, 1.0, selected_tone)?
-                                                };
-                                                Ok((book, rendered))
-                                            }).await;
-                                            match result {
-                                                Ok(Ok((book, rendered))) => {
-                                                    loading.set(false);
-                                                    let mut list = books.get();
-                                                    if !list.iter().any(|b| b.path == book.path) {
-                                                        list.push(book.clone());
-                                                    }
-                                                    save_books(&list);
-                                                    let index = list.iter().position(|b| b.path == book.path).unwrap_or(0);
-                                                    books.set(list);
-                                                    path.set(book.path);
-                                                    selected.set(Some(index));
-                                                    count.set(rendered.count);
-                                                    page.set(book.last_page);
-                                                    let mut cache = vec![None; rendered.count];
-                                                    cache[book.last_page] = Some(rendered.clone());
-                                                    rendered_pages.set(cache);
-                                                    let mut text_cache = vec![None; rendered.count];
-                                                    text_cache[book.last_page] = Some(rendered.text.clone());
-                                                    reading_pages.set(text_cache);
-                                                    pending_pages.set(Vec::new());
-                                                    pending_text_pages.set(Vec::new());
-                                                    request_import(book.last_page);
-                                                    image_path.set(rendered.png.clone());
-                                                    image_size.set(rendered.size);
-                                                    extracted.set(rendered.text);
-                                                    outline.set(rendered.toc);
-                                                    text_runs.set(rendered.text_runs);
-                                                    error.set(String::new());
-                                                }
-                                                Ok(Err(message)) => { loading.set(false); error.set(message); },
-                                                Err(message) => { loading.set(false); error.set(format!("Не удалось открыть PDF: {message}")); },
-                                            }
-                                        });
-                                    }
-                                })
-                                .child(view().flex_row().items_center().gap_2().child(icon(asset!("icons/plus.svg").uri, 16.0, dark)).child(text("Добавить PDF"))),
-                        ),
-                )
+                                    }))),
+                            )
+                                            .child(view().flex_1())
+                            .child(
+                                button()
+                                .on_press({ let press = sidebar_press.clone(); move || press("import") })
+                                    .child(view().flex_row().items_center().gap_2().child(icon(asset!("icons/plus.svg").uri, 16.0, dark)).child(text("Добавить PDF")))
+                            )
+                            .child(text(sidebar_caption()).text_size(px(11.0)))
+                    }
+                }))
                 .child(
                     view()
                         .flex_1()
                         .min_w_0()
                         .flex_col()
-                        .child(
+                        .child((!reader_window).then(|| 
                             view()
                                 .h(px(LIBRARY_BAR_HEIGHT))
                                 .flex_row()
                                 .items_center()
-                                .px(px(SPACE_28))
+                                .pl(move || px(if sidebar_hidden.get() { SPACE_28 + TITLE_CONTROLS_WIDTH } else { SPACE_28 }))
+                                .pr(px(SPACE_28))
                                 .gap_3()
                                 .child(
                                     button()
@@ -563,14 +739,23 @@ pub fn App() -> impl IntoElement {
                                         rgb(if dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })
                                     }),
                                 ),
-                        )
+                        ))
                         .child(dynamic(move || {
                             let request_for_reader = request_visible.clone();
                             let request_text_for_reader = request_text_page.clone();
+                            if reader_window {
+                                // The reader window's contents popover lists the open book's contents.
+                                imago_window_macos::set_contents(
+                                    outline
+                                        .get()
+                                        .into_iter()
+                                        .map(|(title, page, depth)| imago_window_macos::Contents { title, page, depth })
+                                        .collect(),
+                                );
+                            }
                             if let Some(i) = selected.get() {
                                 let list = books.get();
                                 if let Some(book) = list.get(i) {
-                                    let open_page = load_first.clone();
                                     let previous_page = load_prev.clone();
                                     let next_page = load_next.clone();
                         let mut toc_entries = view().flex_col().gap_1();
@@ -586,11 +771,27 @@ pub fn App() -> impl IntoElement {
                                         true,
                                     );
                                     jump(at);
-                                }).child(text(format!(
-                                    "{}{}",
-                                    "  ".repeat(depth.min(8)),
-                                    title
-                                ))),
+                                }).child(
+                                    view()
+                                        .w_full()
+                                        .py(px(8.0))
+                                        .pl(px(12.0 + 14.0 * depth.min(8) as f32))
+                                        .pr(px(12.0))
+                                        .rounded(px(6.0))
+                                        .child(
+                                            text(title)
+                                                .text_size(px(13.0))
+                                                .font_weight(if depth == 0 { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+                                                .text_color(move || rgb(if dark.get() { LIBER_TEXT_DARK } else { LIBER_INK })),
+                                        ),
+                                ),
+                            );
+                        }
+                        if outline.get().is_empty() {
+                            toc_entries = toc_entries.child(
+                                text("В документе нет оглавления")
+                                    .text_size(px(13.0))
+                                    .text_color(move || rgb(if dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })),
                             );
                         }
                         let mut result_entries = view().flex_col().gap_1();
@@ -609,39 +810,107 @@ pub fn App() -> impl IntoElement {
                                 )).text_size(px(11.0))),
                             );
                         }
-                                    return view()
-                                        .flex_1()
+                                    let highlights = liber_core::notes::Notes::open(&liber_core::default_root(), &book.id).items;
+                                    let mut note_entries = view().flex_col().gap_2();
+                                    if highlights.is_empty() {
+                                        note_entries = note_entries.child(
+                                            text("Заметок пока нет")
+                                                .text_size(px(13.0))
+                                                .text_color(move || rgb(if dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })),
+                                        );
+                                    }
+                                    for highlight in highlights {
+                                        let jump = load_first.clone();
+                                        let scroll_ref = reader_scroll_ref;
+                                        let at = highlight.page as usize;
+                                        note_entries = note_entries.child(
+                                            button().on_press(move || {
+                                                scroll_ref.scroll_to_index(
+                                                    at as u32,
+                                                    nsh_core::geometry::Percentage(0.0),
+                                                    px(0.0),
+                                                    true,
+                                                );
+                                                jump(at);
+                                            }).child(
+                                                view()
+                                                    .w_full()
+                                                    .p(px(10.0))
+                                                    .rounded(px(6.0))
+                                                    .flex_col()
+                                                    .gap_1()
+                                                    .child(
+                                                        text(format!("стр. {}", at + 1))
+                                                            .text_size(px(11.0))
+                                                            .text_color(move || rgb(if dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT })),
+                                                    )
+                                                    .child(
+                                                        text(highlight.text.clone())
+                                                            .text_size(px(13.0))
+                                                            .text_color(move || rgb(if dark.get() { LIBER_TEXT_DARK } else { LIBER_INK })),
+                                                    )
+                                                    .child(
+                                                        text(highlight.note.clone())
+                                                            .text_size(px(12.0))
+                                                            .text_color(move || rgb(if dark.get() { LIBER_TEXT_DARK } else { LIBER_INK })),
+                                                    ),
+                                            ),
+                                        );
+                                    }
+                                    // The padding sits inside a fixed-width view: padding on the
+                                    // panel itself would keep 40pt when the panel is closed.
+                                    let notes_panel = view()
+                                        .w(move || px(if notes_sidebar_open.get() { READER_PANEL_WIDTH } else { 0.0 }))
+                                        .overflow_hidden()
+                                        .bg(move || rgb(if dark.get() { LIBER_SURFACE_DARK } else { LIBER_PANEL_LIGHT }))
                                         .flex_col()
-                                        .bg(move || {
-                                            rgb(match tone.get() {
-                                                PageTone::Day => if dark.get() { LIBER_READER_DARK } else { LIBER_READER_LIGHT },
-                                                PageTone::Sepia => 0xE6DCC2,
-                                                PageTone::Gray => 0x29292D,
-                                                PageTone::Night => 0x17171A,
-                                            })
-                                        })
-                                        .child(
-                                            view()
-                                                .h(px(READER_BAR_HEIGHT))
-                                                .flex_row()
-                                                .items_center()
-                                                .px(px(SPACE_20))
-                                                .gap_3()
-                                                .child(view().window_drag(false).child(button().on_press(move || {
+                                        .child(view()
+                                            .w(px(READER_PANEL_WIDTH))
+                                            .flex_1()
+                                            .flex_col()
+                                            .p(px(20.0))
+                                            .gap_3()
+                                            .child(when(move || notes_sidebar_open.get(), move || view()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(text("Заметки").text_size(px(16.0)).font_weight(FontWeight::SEMIBOLD))
+                                                    .child(
+                                                        button()
+                                                            .on_press(move || {
+                                                                animate_layout(nsh_core::LayoutAnimation::EASE_IN_EASE_OUT);
+                                                                notes_sidebar_open.set(false);
+                                                            })
+                                                            .child(icon(asset!("icons/status-x.svg").uri, 16.0, dark)),
+                                                    )))
+                                            .child(scroll().flex_1().child(note_entries)));
+            let bar_load = load_first.clone();
+            let bar_request = request_text_for_reader.clone();
+            let bar_previous = previous_page.clone();
+            let bar_next = next_page.clone();
+            let bar_title = book.title.clone();
+            let bar_row = std::rc::Rc::new(move || {
+                let bar_previous = bar_previous.clone();
+                let bar_next = bar_next.clone();
+                view()
+                    .flex_row()
+                    .items_center()
+                    .px(px(SPACE_20))
+                    .pl(px(SPACE_20))
+                    .gap_3()
+                                                .child((!reader_window).then(|| view().window_drag(false).child(button().on_press(move || {
                                                     animate_layout(nsh_core::LayoutAnimation::EASE_IN_EASE_OUT);
                                                     outline_sidebar_open.set(!outline_sidebar_open.get());
-                                                }).child(icon(asset!("icons/sidebar-left.svg").uri, 16.0, dark))))
-                                                .child(
-                                                    button()
+                                                }).child(icon(asset!("icons/sidebar-left.svg").uri, 16.0, dark)))))
+                                                .child((!reader_window).then(|| button()
                                                         .on_press(move || {
                                                             selected.set(None);
                                                         })
-                                                        .child(view().flex_row().items_center().gap_2().child(icon(asset!("icons/arrow-left.svg").uri, 16.0, dark)).child(text("Библиотека"))),
-                                                )
-                                                .child(text(book.title.clone()).text_size(px(14.0)))
+                                                        .child(view().flex_row().items_center().gap_2().child(icon(asset!("icons/arrow-left.svg").uri, 16.0, dark)).child(text("Библиотека")))))
+                                                .child((!reader_window).then(|| text(bar_title.clone()).text_size(px(14.0))))
                                                 .child(view().flex_1())
                                                 .child(button().on_press({
-                                                    let reopen = load_first.clone();
+                                                    let reopen = bar_load.clone();
                                                     move || {
                                                         let next = tone.get().next();
                                                         tone.set(next);
@@ -652,7 +921,7 @@ pub fn App() -> impl IntoElement {
                                                     }
                                                 }).child(text(move || tone.get().label())))
                                                 .child(button().on_press({
-                                                    let reopen = load_first.clone();
+                                                    let reopen = bar_load.clone();
                                                     move || {
                                                         let next = (zoom.get() - 0.25).max(0.5);
                                                         if (next - zoom.get()).abs() > 0.001 {
@@ -665,7 +934,7 @@ pub fn App() -> impl IntoElement {
                                                 }).child(text("−")))
                                                 .child(text(move || format!("{}%", (zoom.get() * 100.0).round() as u32)).text_size(px(12.0)))
                                                 .child(button().on_press({
-                                                    let reopen = load_first.clone();
+                                                    let reopen = bar_load.clone();
                                                     move || {
                                                         let next = (zoom.get() + 0.25).min(3.0);
                                                         if (next - zoom.get()).abs() > 0.001 {
@@ -679,7 +948,7 @@ pub fn App() -> impl IntoElement {
                                                 .child(
                                                     button()
                                                         .on_press({
-                                                            let request = request_text_for_reader.clone();
+                                                            let request = bar_request.clone();
                                                             move || {
                                                                 let enabled = !text_mode.get();
                                                                 text_mode.set(enabled);
@@ -696,7 +965,7 @@ pub fn App() -> impl IntoElement {
                                                             let at = page.get();
                                                             if at > 0 {
                                                                 reader_scroll_ref.scroll_to_index(at as u32 - 1, nsh_core::geometry::Percentage(0.0), px(0.0), true);
-                                                                previous_page(at - 1);
+                                                                bar_previous(at - 1);
                                                             }
                                                         })
                                                         .child(icon(asset!("icons/arrow-left.svg").uri, 16.0, dark)),
@@ -717,7 +986,7 @@ pub fn App() -> impl IntoElement {
                                                             let at = page.get();
                                                             if at + 1 < count.get() {
                                                                 reader_scroll_ref.scroll_to_index(at as u32 + 1, nsh_core::geometry::Percentage(0.0), px(0.0), true);
-                                                                next_page(at + 1);
+                                                                bar_next(at + 1);
                                                             }
                                                         })
                                                         .child(icon(asset!("icons/arrow-right.svg").uri, 16.0, dark)),
@@ -733,13 +1002,34 @@ pub fn App() -> impl IntoElement {
                                                                 .child(icon(asset!("icons/copy.svg").uri, 16.0, dark))
                                                                 .child(text("Копировать")),
                                                         ),
-                                                ),
-                                        )
+                                                )
+                                                .child(button().on_press(move || {
+                                                    animate_layout(nsh_core::LayoutAnimation::EASE_IN_EASE_OUT);
+                                                    notes_sidebar_open.set(!notes_sidebar_open.get());
+                                                }).child(icon(asset!("icons/inbox.svg").uri, 16.0, dark)))
+            });
+                                    return view()
+                                        .flex_1()
+                                        .flex_col()
+                                        .pt(px(if reader_window { READER_TOOLBAR } else { 0.0 }))
+                                        .bg(move || {
+                                            rgb(match tone.get() {
+                                                PageTone::Day => if dark.get() { LIBER_READER_DARK } else { LIBER_READER_LIGHT },
+                                                PageTone::Sepia => 0xE6DCC2,
+                                                PageTone::Gray => 0x29292D,
+                                                PageTone::Night => 0x17171A,
+                                            })
+                                        })
+                                        .child(view()
+                                                .h(move || px(if reader_window || sidebar::system() { 0.0 } else { READER_BAR_HEIGHT }))
+                                                .overflow_hidden()
+                                                .child((*bar_row)()))
                                         .child(
                                             view()
                                                 .flex_1()
-                                                .flex_row()
+                                                .flex_row_reverse()
                                                 .min_h_0()
+                                                .child(notes_panel)
                                                 .child(dynamic(move || {
                                                     if text_mode.get() {
                                                         virtual_list(move || count.get(), move |position| {
@@ -750,7 +1040,7 @@ pub fn App() -> impl IntoElement {
                                                                     return view().w_full().h(px(220.0)).items_center().justify_center()
                                                                         .child(text("Загрузка текста…").text_color(rgb(LIBER_MUTED_LIGHT))).into_element();
                                                                 };
-                                                                view().w_full().flex().justify_center().py(px(SPACE_36)).selection_area(true).child(
+                                                                view().w_full().flex_row().justify_center().py(px(SPACE_36)).selection_area(true).child(
                                                                     text(body)
                                                                         .max_w(px(700.0))
                                                                         .font_family("Georgia")
@@ -779,7 +1069,7 @@ pub fn App() -> impl IntoElement {
                                                         .into_element()
                                                     } else {
                                                         scroll().flex_1().horizontal().child(
-                                                            view().w_full().min_w(px(680.0 * zoom.get())).flex().justify_center().child(
+                                                            view().w_full().min_w(px(680.0 * zoom.get())).flex_row().justify_center().child(
                                                         virtual_list(move || count.get(), move |position| {
                                                             let index = position.index();
                                                             dynamic(move || {
@@ -814,7 +1104,7 @@ pub fn App() -> impl IntoElement {
                                                                         .h(px(tile.height as f32 * tile_scale))
                                                                         .child(image(tile.png).w_full().h_full()));
                                                                 }
-                                                                view().w_full().flex().justify_center().child(
+                                                                view().w_full().flex_row().justify_center().child(
                                                                     view().relative().selection_area(true).w(px(display_width)).h(px(image_height))
                                                                         .child(image(rendered.png).w(px(display_width)).h(px(image_height)))
                                                                         .child(tiles).child(selectable)
@@ -868,7 +1158,7 @@ pub fn App() -> impl IntoElement {
                                                         ).into_element()
                                                     }
                                                 }))
-                                                .child(view().w(move || px(if outline_sidebar_open.get() { READER_PANEL_WIDTH } else { 0.0 }))
+                                                .child((!reader_window).then(|| view().w(move || px(if !sidebar::system() && outline_sidebar_open.get() { READER_PANEL_WIDTH } else { 0.0 }))
                                                         .overflow_hidden()
                                                         .bg(move || {
                                                             rgb(if dark.get() {
@@ -881,9 +1171,23 @@ pub fn App() -> impl IntoElement {
                                                         .p(px(20.0))
                                                         .gap_3()
                                                         .child(
-                                                            text("Содержание")
-                                                                .text_size(px(16.0))
-                                                                .font_weight(FontWeight::SEMIBOLD),
+                                                            view()
+                                                                .flex_row()
+                                                                .items_center()
+                                                                .justify_between()
+                                                                .child(
+                                                                    text("Содержание")
+                                                                        .text_size(px(16.0))
+                                                                        .font_weight(FontWeight::SEMIBOLD),
+                                                                )
+                                                                .child(
+                                                                    button()
+                                                                        .on_press(move || {
+                                                                            animate_layout(nsh_core::LayoutAnimation::EASE_IN_EASE_OUT);
+                                                                            outline_sidebar_open.set(false);
+                                                                        })
+                                                                        .child(icon(asset!("icons/status-x.svg").uri, 16.0, dark)),
+                                                                ),
                                                         )
                                                         .child(toc_entries)
                                                         .child(
@@ -937,9 +1241,28 @@ pub fn App() -> impl IntoElement {
                                                                     .line_height(px(22.0)),
                                                             ),
                                                         ).into_element()
-                                                )
+                                                ))
                                         ).into_element();
                                 }
+                            }
+                            if section.get() == Page::Settings {
+                                let press = sidebar_press.clone();
+                                return view()
+                                    .flex_1()
+                                    .px(px(SPACE_32))
+                                    .py(px(SPACE_24))
+                                    .gap_6()
+                                    .child(
+                                        text("Настройки")
+                                            .text_size(px(20.0))
+                                            .font_weight(FontWeight::SEMIBOLD),
+                                    )
+                                    .child(
+                                        button()
+                                            .on_press(move || press("theme"))
+                                            .child(text(move || if dark.get() { "Тема: тёмная" } else { "Тема: светлая" })),
+                                    )
+                                    .into_element();
                             }
                             let list = books.get();
                             let mut shelf = view().flex_row().flex_wrap().gap_5();
@@ -952,18 +1275,14 @@ pub fn App() -> impl IntoElement {
                                 ""
                             };
                             for book in visible {
-                                let i = list
-                                    .iter()
-                                    .position(|candidate| candidate.path == book.path)
-                                    .unwrap_or(0);
                                 let name = book.title.clone();
+                                let reader_title = name.clone();
                                 let author = book.author.clone();
                                 let page_count = book.pages;
                                 let last_page = book.last_page;
                                 let progress = book.progress();
                                 let cover = book.cover.clone();
                                 let source = book.path.clone();
-                                let open_book = load_first.clone();
                                 let page_count_signal = count;
                                 let pages_signal = rendered_pages;
                                 let reading_signal = reading_pages;
@@ -986,8 +1305,7 @@ pub fn App() -> impl IntoElement {
                                                     search_generation.set(search_generation.get().wrapping_add(1));
                                                     document_query.set(String::new());
                                                     search_hits.set(Vec::new());
-                                                    selected.set(Some(i));
-                                                    open_book(last_page);
+                                                    open_reader_window(&source, &reader_title);
                                                 })
                                                 .child(
                                                     view()
@@ -1053,7 +1371,7 @@ pub fn App() -> impl IntoElement {
                                 .py(px(SPACE_24))
                                 .gap_6()
                                 .child(
-                                    text("Читаю сейчас")
+                                    text(if section.get() == Page::All { "Все книги" } else { "Читаю сейчас" })
                                         .text_size(px(20.0))
                                         .font_weight(FontWeight::SEMIBOLD),
                                 )
@@ -1063,7 +1381,7 @@ pub fn App() -> impl IntoElement {
                                         .placeholder("Поиск по названию или автору")
                                         .on_change(move |value: &str| query.set(value.to_owned())),
                                 )
-                                .child(text("Недавно добавленные").text_size(px(13.0)).text_color(
+                                .child(text(if section.get() == Page::All { "" } else { "Недавно добавленные" }).text_size(px(13.0)).text_color(
                                     move || rgb(if dark.get() { LIBER_MUTED_DARK } else { LIBER_MUTED_LIGHT }),
                                 ))
                                 .child(text(message).text_color(move || {

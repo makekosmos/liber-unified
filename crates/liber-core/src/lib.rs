@@ -2,6 +2,7 @@
 use mupdf::{
     Colorspace, Document, Matrix, MetadataName, TextBlockContent, TextExtractOptions, TextPageFlags,
 };
+pub mod notes;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},

@@ -9,14 +9,28 @@ use nsh_platform_macos as platform;
 #[cfg(target_os = "windows")]
 use nsh_platform_windows as platform;
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// macOS: the window is AppKit's split view with the library's sidebar.
+#[cfg(target_os = "macos")]
+fn main() -> impl std::process::Termination {
+    env_logger::init();
+    liber::sidebar::SYSTEM.store(true, std::sync::atomic::Ordering::Relaxed);
+    liber::open_startup_reader();
+    imago_window_macos::run(
+        "Liber",
+        (1200.0, 820.0),
+        liber::sidebar::system_rows(),
+        || platform::Root::of::<liber::App>(),
+        || platform::Root::of::<liber::ReaderApp>(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> impl std::process::Termination {
     env_logger::init();
     platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<liber::App>()),
         platform::AppOptions {
             title: "Liber".to_owned(),
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
             app_id: "com.kosmos.liber".to_owned(),
             size: (1200, 820),
             ..Default::default()
